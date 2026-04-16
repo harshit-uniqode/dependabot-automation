@@ -1,0 +1,34 @@
+{
+  "resource": "/api/endpoint",
+  "path": "/api/endpoint",
+  "httpMethod": "POST",
+  "headers": {
+    "Content-Type": "application/json",
+    "Authorization": "Bearer test-token",
+    "Host": "localhost:4566"
+  },
+  "multiValueHeaders": {},
+  "queryStringParameters": {
+    "param1": "value1"
+  },
+  "multiValueQueryStringParameters": {},
+  "pathParameters": null,
+  "stageVariables": null,
+  "requestContext": {
+    "resourceId": "test",
+    "resourcePath": "/api/endpoint",
+    "httpMethod": "POST",
+    "requestId": "test-request-id",
+    "requestTime": "16/Apr/2026:10:00:00 +0000",
+    "path": "/api/endpoint",
+    "accountId": "000000000000",
+    "protocol": "HTTP/1.1",
+    "stage": "test",
+    "requestTimeEpoch": 1713196800000,
+    "identity": {
+      "sourceIp": "127.0.0.1"
+    }
+  },
+  "body": "{\"key\": \"value\", \"action\": \"test\"}",
+  "isBase64Encoded": false
+}

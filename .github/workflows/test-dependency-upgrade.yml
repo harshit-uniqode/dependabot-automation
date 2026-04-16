@@ -1,0 +1,84 @@
+name: Test Dependency Upgrade
+
+on:
+  pull_request:
+    paths:
+      - '**/package.json'
+      - '**/package-lock.json'
+      - '**/requirements.txt'
+      - '**/requirements*.txt'
+
+jobs:
+  test:
+    name: Lambda Integration Tests
+    runs-on: ubuntu-latest
+
+    services:
+      emulator:
+        image: hectorvent/floci:latest
+        ports:
+          - "4566:4566"
+        options: >-
+          --health-cmd "curl -f http://localhost:4566/_floci/health || curl -f http://localhost:4566/_localstack/health"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 15
+          --health-start-period 20s
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Set up Python (for Python Lambdas)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install AWS SAM CLI
+        uses: aws-actions/setup-sam@v2
+
+      - name: Install awslocal CLI
+        run: pip install awscli-local
+
+      - name: Wait for emulator
+        run: |
+          until curl -sf http://localhost:4566/_floci/health > /dev/null 2>&1 || \
+                curl -sf http://localhost:4566/_localstack/health > /dev/null 2>&1; do
+            echo "Waiting for emulator..."; sleep 2
+          done
+          echo "Emulator ready."
+
+      - name: Set up AWS test resources
+        env:
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_DEFAULT_REGION: us-east-1
+        run: ./scripts/setup-local-resources.sh
+
+      - name: Install dependencies
+        run: |
+          if [ -f package.json ]; then npm ci; fi
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Run integration tests
+        env:
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_DEFAULT_REGION: us-east-1
+          AWS_ENDPOINT_URL: http://localhost:4566
+        run: |
+          if [ -f package.json ] && grep -q '"test:integration"' package.json; then
+            npm run test:integration
+          else
+            echo "No integration tests found — add 'test:integration' script to package.json"
+          fi
+
+      - name: Teardown resources
+        if: always()
+        run: ./scripts/teardown.sh

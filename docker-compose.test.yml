@@ -1,0 +1,26 @@
+version: "3.8"
+
+# Floci — free, MIT-licensed, zero-auth AWS emulator
+# Covers: S3, SQS, DynamoDB, Lambda, SNS, SES, API Gateway, KMS, CloudWatch
+# Docs: https://github.com/hectorvent/floci
+
+services:
+  emulator:
+    image: hectorvent/floci:latest
+    container_name: lambda-test-emulator
+    ports:
+      - "4566:4566"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock"
+    environment:
+      - SERVICES=s3,sqs,dynamodb,lambda,sns,ses,apigateway,kms,cloudwatch
+      - DEBUG=0
+      - AWS_DEFAULT_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_floci/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
