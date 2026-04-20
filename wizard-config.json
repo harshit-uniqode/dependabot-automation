@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "server": {
+    "port": 8787,
+    "host": "127.0.0.1",
+    "emulator_endpoint": "http://localhost:4566",
+    "job_ttl_seconds": 3600,
+    "max_queue_depth": 3
+  },
+  "repos": [
+    {
+      "name": "beaconstac_angular_portal",
+      "path": "/Users/harshitky/Desktop/Work/beaconstac_angular_portal",
+      "github": "mobstac-private/beaconstac_angular_portal",
+      "type": "angular",
+      "package_dir": "bac-app",
+      "default_base_branch": "develop",
+      "test_commands": {
+        "build": "npx ng build --configuration production",
+        "unit_test": "npx ng test --watch=false --browsers=ChromeHeadless"
+      }
+    },
+    {
+      "name": "beaconstac_lambda_functions",
+      "path": "/Users/harshitky/Desktop/Work/beaconstac_lambda_functions",
+      "github": "mobstac-private/beaconstac_lambda_functions",
+      "type": "lambda_monorepo",
+      "default_base_branch": "develop"
+    }
+  ]
+}

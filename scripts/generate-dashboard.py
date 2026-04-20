@@ -2,38 +2,65 @@
 """
 generate-dashboard.py
 Fetches live Dependabot alerts from a GitHub repo, classifies them,
-and writes vulnerability-tracker/dashboard.html.
+enriches with bump-type / changelog URL / function name, and writes
+a self-contained HTML dashboard.
 
 Usage:
-  python3 scripts/generate-dashboard.py [owner/repo]
+  python3 scripts/generate-dashboard.py                                  # angular (default)
+  python3 scripts/generate-dashboard.py mobstac-private/beaconstac_lambda_functions
+  python3 scripts/generate-dashboard.py --repo mobstac-private/beaconstac_lambda_functions
 
 Requires: gh CLI authenticated with repo scope.
 """
 
+from __future__ import annotations
+
 import json
+import re
 import subprocess
 import sys
 import os
 from datetime import datetime, timezone
 from pathlib import Path
 
+
 # ─────────────────────────────────────────────────────────────
-# CONFIG
+# REPO CONFIG REGISTRY
+# Each entry describes how to handle a specific GitHub repo.
 # ─────────────────────────────────────────────────────────────
+
+_PROJECT_ROOT = Path(__file__).parent.parent
+
+REPO_CONFIGS: dict[str, dict] = {
+    "mobstac-private/beaconstac_angular_portal": {
+        "label":       "Angular Portal",
+        "local_path":  "/Users/harshitky/Desktop/Work/beaconstac_angular_portal",
+        "deps_mode":   "angular",
+        "package_dir": "bac-app",
+        "output":      _PROJECT_ROOT / "vulnerability-tracker" / "dashboard.html",
+    },
+    "mobstac-private/beaconstac_lambda_functions": {
+        "label":       "Lambda Functions",
+        "local_path":  "/Users/harshitky/Desktop/Work/beaconstac_lambda_functions",
+        "deps_mode":   "lambda_monorepo",
+        "output":      _PROJECT_ROOT / "vulnerability-tracker" / "lambda-dashboard.html",
+    },
+}
+
 DEFAULT_REPO = "mobstac-private/beaconstac_angular_portal"
-PACKAGE_JSON_PATH = "/Users/harshitky/Desktop/Work/beaconstac_angular_portal/bac-app/package.json"
-OUTPUT_PATH = Path(__file__).parent.parent / "vulnerability-tracker" / "dashboard.html"
+
+# ── Severity / Priority tables ───────────────────────────────
 
 SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
 
 ACTION_MAP = {
-    ("CRITICAL", "direct"):       "FIX NOW",
+    ("CRITICAL", "direct"):         "FIX NOW",
     ("CRITICAL", "sub-dependency"): "FIX NOW",
-    ("HIGH",     "direct"):       "FIX - direct",
+    ("HIGH",     "direct"):         "FIX - direct",
     ("HIGH",     "sub-dependency"): "FIX - sub-dep",
-    ("MEDIUM",   "direct"):       "FIX - medium direct",
+    ("MEDIUM",   "direct"):         "FIX - medium direct",
     ("MEDIUM",   "sub-dependency"): "DEFER or ignore if dev-only",
-    ("LOW",      "direct"):       "BATCH end of quarter",
+    ("LOW",      "direct"):         "BATCH end of quarter",
     ("LOW",      "sub-dependency"): "BATCH end of quarter",
 }
 
@@ -52,18 +79,17 @@ PRIORITY_MAP = {
 # ─────────────────────────────────────────────────────────────
 # FETCH ALERTS
 # ─────────────────────────────────────────────────────────────
-def fetch_alerts(repo):
+
+def fetch_alerts(repo: str) -> list[dict]:
     print(f"  Fetching Dependabot alerts from {repo}...")
     result = subprocess.run(
-        ["gh", "api", f"repos/{repo}/dependabot/alerts",
-         "--paginate", "-q", ".[]"],
-        capture_output=True, text=True
+        ["gh", "api", f"repos/{repo}/dependabot/alerts", "--paginate", "-q", ".[]"],
+        capture_output=True, text=True,
     )
     if result.returncode != 0:
         print(f"ERROR: gh api failed:\n{result.stderr}", file=sys.stderr)
         sys.exit(1)
 
-    # gh --paginate with -q ".[]" emits one JSON object per line
     alerts = []
     for line in result.stdout.strip().splitlines():
         line = line.strip()
@@ -79,63 +105,275 @@ def fetch_alerts(repo):
 
 
 # ─────────────────────────────────────────────────────────────
-# LOAD DIRECT DEPS
+# DIRECT DEPS LOADING
 # ─────────────────────────────────────────────────────────────
-def load_direct_deps(pkg_json_path):
+
+def load_direct_deps(repo_cfg: dict) -> set[str]:
+    """Return set of direct dependency names for the repo."""
+    mode = repo_cfg.get("deps_mode", "angular")
+    if mode == "angular":
+        return _load_angular_deps(repo_cfg)
+    if mode == "lambda_monorepo":
+        return _load_lambda_deps(repo_cfg)
+    return set()
+
+
+def _load_angular_deps(repo_cfg: dict) -> set[str]:
+    pkg_dir = repo_cfg.get("package_dir", "")
+    pkg_path = Path(repo_cfg["local_path"]) / pkg_dir / "package.json"
     try:
-        with open(pkg_json_path) as f:
-            pkg = json.load(f)
-        deps = set()
+        pkg = json.loads(pkg_path.read_text())
+        deps: set[str] = set()
         for key in ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies"):
             deps.update(pkg.get(key, {}).keys())
-        print(f"  Loaded {len(deps)} direct deps from package.json")
+        print(f"  Loaded {len(deps)} direct deps from {pkg_path}")
         return deps
     except FileNotFoundError:
-        print(f"  WARNING: package.json not found at {pkg_json_path}, all deps will be 'sub-dependency'")
+        print(f"  WARNING: package.json not found at {pkg_path}")
         return set()
+
+
+def _load_lambda_deps(repo_cfg: dict) -> set[str]:
+    """
+    Scan all function subdirs in the lambda monorepo.
+    A function dir has serverless.yml at its root.
+    Collect deps from requirements.txt and package.json in each.
+    """
+    root = Path(repo_cfg["local_path"])
+    deps: set[str] = set()
+    fn_dirs: list[str] = []
+
+    for d in sorted(root.iterdir()):
+        if not d.is_dir() or d.name.startswith("."):
+            continue
+        if not (d / "serverless.yml").exists():
+            continue
+        fn_dirs.append(d.name)
+
+        # Python deps
+        req = d / "requirements.txt"
+        if req.exists():
+            for line in req.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or line.startswith("-"):
+                    continue
+                # normalise: "requests==2.28.0" → "requests"
+                name = re.split(r"[>=<!;\s\[]", line)[0].strip()
+                if name:
+                    deps.add(name.lower())
+
+        # Node deps
+        pkg_json = d / "package.json"
+        if pkg_json.exists():
+            try:
+                pkg = json.loads(pkg_json.read_text())
+                for key in ("dependencies", "devDependencies"):
+                    deps.update(pkg.get(key, {}).keys())
+            except json.JSONDecodeError:
+                pass
+
+    print(f"  Scanned {len(fn_dirs)} Lambda functions, found {len(deps)} unique direct deps")
+    return deps
+
+
+# ─────────────────────────────────────────────────────────────
+# ENRICHMENT — bump type, function name, changelog URL
+# ─────────────────────────────────────────────────────────────
+
+# Cache GitHub repo URLs to avoid redundant npm/PyPI lookups
+_changelog_cache: dict[tuple[str, str], str] = {}
+
+
+def _get_npm_changelog_url(pkg: str) -> str:
+    cache_key = ("npm", pkg)
+    if cache_key in _changelog_cache:
+        return _changelog_cache[cache_key]
+
+    fallback = f"https://www.npmjs.com/package/{pkg}?activeTab=versions"
+    try:
+        proc = subprocess.run(
+            ["npm", "view", pkg, "repository.url"],
+            capture_output=True, text=True, timeout=10,
+        )
+        repo_url = proc.stdout.strip()
+        if repo_url and "github.com" in repo_url:
+            repo_url = re.sub(r"^git\+", "", repo_url)
+            repo_url = re.sub(r"\.git$", "", repo_url)
+            repo_url = re.sub(r"^git://", "https://", repo_url)
+            url = repo_url + "/releases"
+        else:
+            url = fallback
+    except Exception:
+        url = fallback
+
+    _changelog_cache[cache_key] = url
+    return url
+
+
+def _get_pip_changelog_url(pkg: str) -> str:
+    cache_key = ("pip", pkg)
+    if cache_key in _changelog_cache:
+        return _changelog_cache[cache_key]
+
+    fallback = f"https://pypi.org/project/{pkg}/#history"
+    try:
+        proc = subprocess.run(
+            ["curl", "-s", "--max-time", "6", f"https://pypi.org/pypi/{pkg}/json"],
+            capture_output=True, text=True, timeout=10,
+        )
+        data = json.loads(proc.stdout)
+        urls = data.get("info", {}).get("project_urls") or {}
+        src = urls.get("Changelog") or urls.get("Source") or urls.get("Homepage") or ""
+        if src and "github.com" in src:
+            url = src.rstrip("/") + "/releases"
+        elif src:
+            url = src
+        else:
+            url = fallback
+    except Exception:
+        url = fallback
+
+    _changelog_cache[cache_key] = url
+    return url
+
+
+_VERSION_RE = re.compile(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?")
+
+
+def _parse_bump_type(vuln_range: str, patched: str) -> str:
+    """
+    Classify the required upgrade as 'patch', 'minor', or 'major'.
+
+    Strategy: find the lower bound in the vulnerable_version_range.
+    If missing, use 0.0.0.  Compare lower bound major.minor to patched.
+
+    Examples:
+      ">= 1.0.0, < 1.15.0"  →  1.0.0 → 1.15.0  = minor
+      ">= 3.0.0, < 3.1.1"   →  3.0.0 → 3.1.1   = minor
+      "< 2.0.0"             →  0.0.0 → 2.0.0   = major
+      ">= 3.1.0, < 3.1.2"   →  3.1.0 → 3.1.2   = patch
+    """
+    if not patched:
+        return "unknown"
+
+    # Try to find lower bound (>= x.y.z)
+    lower_match = re.search(r">=\s*([0-9]+\.[0-9]+(?:\.[0-9]+)?)", vuln_range)
+    lower = lower_match.group(1) if lower_match else "0.0.0"
+
+    try:
+        f = lower.split(".")
+        t = patched.split(".")
+        # Pad to 3 parts
+        while len(f) < 3: f.append("0")
+        while len(t) < 3: t.append("0")
+        fi = [int(x) for x in f[:3]]
+        ti = [int(x) for x in t[:3]]
+
+        if fi[0] != ti[0]:
+            return "major"
+        if fi[1] != ti[1]:
+            return "minor"
+        return "patch"
+    except (ValueError, IndexError):
+        return "unknown"
+
+
+def _function_name_from_manifest(manifest: str) -> str:
+    """
+    Extract Lambda function dir name from manifest path.
+    e.g. "beaconstac_profile_picture/package-lock.json" → "beaconstac_profile_picture"
+    """
+    if not manifest or "/" not in manifest:
+        return ""
+    return manifest.split("/")[0]
+
+
+def _current_version_from_range(vuln_range: str) -> str:
+    """
+    Best-effort current version from vulnerable_version_range.
+    Returns the upper bound minus 1 patch (informational only).
+    e.g. "< 1.15.0"  → "< 1.15.0 (any)"
+    """
+    return vuln_range.strip() if vuln_range else ""
 
 
 # ─────────────────────────────────────────────────────────────
 # CLASSIFY & SORT
 # ─────────────────────────────────────────────────────────────
-def classify(alerts, direct_deps):
-    rows = []
-    for a in alerts:
-        alert_id = f"#{a['number']}"
-        pkg = a["dependency"]["package"]["name"]
-        ecosystem = a["dependency"]["package"]["ecosystem"]
-        severity = (a.get("security_advisory") or {}).get("severity", "").upper()
-        cvss_raw = ((a.get("security_advisory") or {}).get("cvss") or {}).get("score", 0) or 0
-        cvss = round(float(cvss_raw), 1)
-        scope = a["dependency"].get("scope") or "development"
-        manifest = a["dependency"].get("manifest_path") or ""
-        patched_versions = (a.get("security_vulnerability") or {}).get("first_patched_version") or {}
-        patched = patched_versions.get("identifier", "") if isinstance(patched_versions, dict) else str(patched_versions)
-        summary = (a.get("security_advisory") or {}).get("summary", "")[:120]
 
-        dep_type = "direct" if pkg in direct_deps else "sub-dependency"
-        action = ACTION_MAP.get((severity, dep_type), "REVIEW")
+def classify(alerts: list[dict], direct_deps: set[str]) -> list[dict]:
+    """Parse raw Dependabot alert dicts into dashboard row dicts."""
+    print("  Classifying alerts and enriching metadata...")
+
+    # Collect unique packages for changelog URL lookup
+    pkg_eco_pairs: set[tuple[str, str]] = set()
+    for a in alerts:
+        pkg = a["dependency"]["package"]["name"]
+        eco = a["dependency"]["package"]["ecosystem"]
+        pkg_eco_pairs.add((pkg, eco))
+
+    print(f"  Fetching changelog URLs for {len(pkg_eco_pairs)} unique packages...")
+    for pkg, eco in pkg_eco_pairs:
+        if eco == "npm":
+            _get_npm_changelog_url(pkg)
+        elif eco == "pip":
+            _get_pip_changelog_url(pkg)
+
+    rows: list[dict] = []
+    for a in alerts:
+        alert_id     = f"#{a['number']}"
+        pkg          = a["dependency"]["package"]["name"]
+        ecosystem    = a["dependency"]["package"]["ecosystem"]
+        severity     = (a.get("security_advisory") or {}).get("severity", "").upper()
+        cvss_raw     = ((a.get("security_advisory") or {}).get("cvss") or {}).get("score", 0) or 0
+        cvss         = round(float(cvss_raw), 1)
+        scope        = a["dependency"].get("scope") or "development"
+        manifest     = a["dependency"].get("manifest_path") or ""
+        vuln_range   = (a.get("security_vulnerability") or {}).get("vulnerable_version_range") or ""
+        patched_raw  = (a.get("security_vulnerability") or {}).get("first_patched_version") or {}
+        patched      = patched_raw.get("identifier", "") if isinstance(patched_raw, dict) else str(patched_raw)
+        summary      = (a.get("security_advisory") or {}).get("summary", "")[:120]
+
+        # Normalise package name for pip comparison (pip uses lowercase with _ or -)
+        pkg_lookup = pkg.lower().replace("-", "_") if ecosystem == "pip" else pkg
+        dep_type   = "direct" if (pkg in direct_deps or pkg_lookup in direct_deps) else "sub-dependency"
+
+        action   = ACTION_MAP.get((severity, dep_type), "REVIEW")
         priority = PRIORITY_MAP.get((severity, dep_type), 9)
 
+        bump_type     = _parse_bump_type(vuln_range, patched)
+        function_name = _function_name_from_manifest(manifest)
+        vuln_range_display = _current_version_from_range(vuln_range)
+
+        if ecosystem == "npm":
+            changelog_url = _changelog_cache.get(("npm", pkg), f"https://www.npmjs.com/package/{pkg}?activeTab=versions")
+        elif ecosystem == "pip":
+            changelog_url = _changelog_cache.get(("pip", pkg), f"https://pypi.org/project/{pkg}/#history")
+        else:
+            changelog_url = ""
+
         rows.append({
-            "alertId": alert_id,
-            "pkg": pkg,
-            "eco": ecosystem,
-            "severity": severity,
-            "cvss": cvss,
-            "scope": scope,
-            "manifest": manifest,
-            "depType": dep_type,
-            "patched": patched,
-            "summary": summary,
-            "action": action,
-            "priority": priority,
-            "status": "To Do",
-            "notes": "",
-            "resolvedAt": "",
+            "alertId":      alert_id,
+            "pkg":          pkg,
+            "eco":          ecosystem,
+            "severity":     severity,
+            "cvss":         cvss,
+            "scope":        scope,
+            "manifest":     manifest,
+            "depType":      dep_type,
+            "patched":      patched,
+            "vulnRange":    vuln_range_display,
+            "summary":      summary,
+            "action":       action,
+            "priority":     priority,
+            "bumpType":     bump_type,
+            "functionName": function_name,
+            "changelogUrl": changelog_url,
+            "status":       "To Do",
+            "notes":        "",
+            "resolvedAt":   "",
         })
 
-    # Sort: priority asc, then CVSS desc
     rows.sort(key=lambda r: (r["priority"], -r["cvss"], r["pkg"]))
     return rows
 
@@ -143,9 +381,10 @@ def classify(alerts, direct_deps):
 # ─────────────────────────────────────────────────────────────
 # STATS
 # ─────────────────────────────────────────────────────────────
-def compute_stats(rows):
-    stats = {
-        "total": len(rows),
+
+def compute_stats(rows: list[dict]) -> dict:
+    return {
+        "total":    len(rows),
         "critical": sum(1 for r in rows if r["severity"] == "CRITICAL"),
         "high":     sum(1 for r in rows if r["severity"] == "HIGH"),
         "medium":   sum(1 for r in rows if r["severity"] == "MEDIUM"),
@@ -154,25 +393,32 @@ def compute_stats(rows):
         "sub":      sum(1 for r in rows if r["depType"] == "sub-dependency"),
         "runtime":  sum(1 for r in rows if r["scope"] == "runtime"),
         "dev":      sum(1 for r in rows if r["scope"] == "development"),
+        "patch":    sum(1 for r in rows if r["bumpType"] == "patch"),
+        "minor":    sum(1 for r in rows if r["bumpType"] == "minor"),
+        "major":    sum(1 for r in rows if r["bumpType"] == "major"),
     }
-    return stats
 
 
 # ─────────────────────────────────────────────────────────────
 # JS DATA ARRAY
 # ─────────────────────────────────────────────────────────────
-def rows_to_js(rows):
+
+def rows_to_js(rows: list[dict]) -> str:
     parts = []
     for r in rows:
-        def esc(s):
+        def esc(s: object) -> str:
             return str(s).replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
 
         parts.append(
             f'  {{alertId:"{esc(r["alertId"])}",pkg:"{esc(r["pkg"])}",eco:"{esc(r["eco"])}",'
             f'severity:"{esc(r["severity"])}",cvss:{r["cvss"]},scope:"{esc(r["scope"])}",'
             f'manifest:"{esc(r["manifest"])}",depType:"{esc(r["depType"])}",'
-            f'patched:"{esc(r["patched"])}",summary:"{esc(r["summary"])}",'
+            f'patched:"{esc(r["patched"])}",vulnRange:"{esc(r["vulnRange"])}",'
+            f'summary:"{esc(r["summary"])}",'
             f'action:"{esc(r["action"])}",priority:{r["priority"]},'
+            f'bumpType:"{esc(r["bumpType"])}",'
+            f'functionName:"{esc(r["functionName"])}",'
+            f'changelogUrl:"{esc(r["changelogUrl"])}",'
             f'status:"To Do",notes:"",resolvedAt:""}}'
         )
     return "[\n" + ",\n".join(parts) + "\n]"
@@ -181,33 +427,25 @@ def rows_to_js(rows):
 # ─────────────────────────────────────────────────────────────
 # HTML TEMPLATE
 # ─────────────────────────────────────────────────────────────
-def build_html(repo, rows, stats, generated_at):
-    repo_name = repo.split("/")[-1]
+
+def build_html(repo: str, label: str, rows: list[dict], stats: dict, generated_at: str) -> str:
     js_data = rows_to_js(rows)
     runtime_pct = round(stats["runtime"] / stats["total"] * 100, 1) if stats["total"] else 0
-    dev_pct = round(stats["dev"] / stats["total"] * 100, 1) if stats["total"] else 0
+    dev_pct     = round(stats["dev"]     / stats["total"] * 100, 1) if stats["total"] else 0
 
-    # Direct dep runtime high/critical count for footnote
-    direct_runtime_high = sum(
-        1 for r in rows
-        if r["depType"] == "direct" and r["scope"] == "runtime"
-        and r["severity"] in ("CRITICAL", "HIGH")
-    )
-    direct_dev = sum(1 for r in rows if r["depType"] == "direct" and r["scope"] == "development")
-    direct_runtime_medium = sum(
-        1 for r in rows
-        if r["depType"] == "direct" and r["scope"] == "runtime" and r["severity"] == "MEDIUM"
-    )
-    sub_high = sum(1 for r in rows if r["depType"] == "sub-dependency" and r["severity"] in ("CRITICAL", "HIGH"))
-    sub_medium = sum(1 for r in rows if r["depType"] == "sub-dependency" and r["severity"] == "MEDIUM")
-    sub_low = sum(1 for r in rows if r["depType"] == "sub-dependency" and r["severity"] == "LOW")
+    direct_runtime_high   = sum(1 for r in rows if r["depType"] == "direct"   and r["scope"] == "runtime" and r["severity"] in ("CRITICAL","HIGH"))
+    direct_dev            = sum(1 for r in rows if r["depType"] == "direct"   and r["scope"] == "development")
+    direct_runtime_medium = sum(1 for r in rows if r["depType"] == "direct"   and r["scope"] == "runtime" and r["severity"] == "MEDIUM")
+    sub_high              = sum(1 for r in rows if r["depType"] == "sub-dependency" and r["severity"] in ("CRITICAL","HIGH"))
+    sub_medium            = sum(1 for r in rows if r["depType"] == "sub-dependency" and r["severity"] == "MEDIUM")
+    sub_low               = sum(1 for r in rows if r["depType"] == "sub-dependency" and r["severity"] == "LOW")
 
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Dependabot Vulnerability Tracker — {repo_name}</title>
+<title>Dependabot Vulnerability Tracker — {label}</title>
 <style>
   *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
 
@@ -237,6 +475,9 @@ def build_html(repo, rows, stats, generated_at):
     --green-bg:      #0d1f12;
     --green-border:  #1a4023;
     --purple:        #bc8cff;
+    --purple-bg:     #1a0f2e;
+    --purple-border: #3d2460;
+    --teal:          #39d353;
     --gray:          #484f58;
     --gray-bg:       #161b22;
     --radius-sm:     4px;
@@ -246,27 +487,18 @@ def build_html(repo, rows, stats, generated_at):
   }}
 
   html {{ scroll-behavior: smooth; }}
-
   body {{
     background: var(--bg-primary);
     color: var(--text-primary);
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
-    font-size: 14px;
-    line-height: 1.5;
-    min-height: 100vh;
+    font-size: 14px; line-height: 1.5; min-height: 100vh;
   }}
 
   /* ── TOP BAR ── */
   .topbar {{
-    background: var(--bg-secondary);
-    border-bottom: 1px solid var(--border);
-    padding: 20px 32px;
-    position: sticky;
-    top: 0;
-    z-index: 100;
-    display: flex;
-    align-items: center;
-    gap: 16px;
+    background: var(--bg-secondary); border-bottom: 1px solid var(--border);
+    padding: 20px 32px; position: sticky; top: 0; z-index: 100;
+    display: flex; align-items: center; gap: 16px;
   }}
   .topbar-icon {{
     width: 36px; height: 36px;
@@ -275,56 +507,41 @@ def build_html(repo, rows, stats, generated_at):
     display: flex; align-items: center; justify-content: center;
     font-size: 18px; flex-shrink: 0;
   }}
-  .topbar-text h1 {{
-    font-size: 17px; font-weight: 600;
-    color: var(--text-primary); letter-spacing: -0.01em;
-  }}
-  .topbar-text p {{ font-size: 12px; color: var(--text-secondary); margin-top: 2px; }}
+  .topbar-text h1 {{ font-size: 17px; font-weight: 600; color: var(--text-primary); letter-spacing: -0.01em; }}
+  .topbar-text p  {{ font-size: 12px; color: var(--text-secondary); margin-top: 2px; }}
   .topbar-text p span {{ color: var(--orange); font-weight: 600; }}
   .topbar-meta {{
     margin-left: auto; display: flex; align-items: center;
     gap: 8px; font-size: 12px; color: var(--text-muted);
   }}
-  .live-dot {{
-    width: 7px; height: 7px; background: var(--green);
-    border-radius: 50%; animation: pulse 2s infinite;
-  }}
+  .live-dot {{ width: 7px; height: 7px; background: var(--green); border-radius: 50%; animation: pulse 2s infinite; }}
   @keyframes pulse {{ 0%, 100% {{ opacity: 1; }} 50% {{ opacity: .4; }} }}
 
-  /* ── MAIN LAYOUT ── */
+  /* ── LAYOUT ── */
   .container {{ max-width: 1400px; margin: 0 auto; padding: 28px 32px; }}
-
-  /* ── SECTION LABEL ── */
   .section-label {{
     font-size: 11px; font-weight: 600; text-transform: uppercase;
     letter-spacing: .08em; color: var(--text-muted); margin-bottom: 12px;
   }}
 
   /* ── SUMMARY CARDS ── */
-  .cards-grid {{
-    display: grid; grid-template-columns: repeat(4, 1fr);
-    gap: 12px; margin-bottom: 28px;
-  }}
+  .cards-grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 28px; }}
   @media (max-width: 900px) {{ .cards-grid {{ grid-template-columns: repeat(2, 1fr); }} }}
-
   .card {{
     background: var(--bg-secondary); border: 1px solid var(--border);
     border-radius: var(--radius-lg); padding: 20px;
-    position: relative; overflow: hidden;
-    transition: border-color .15s, transform .15s;
+    position: relative; overflow: hidden; transition: border-color .15s, transform .15s;
   }}
   .card:hover {{ transform: translateY(-1px); }}
-  .card::before {{
-    content: ''; position: absolute; top: 0; left: 0; right: 0; height: 3px;
-  }}
+  .card::before {{ content: ''; position: absolute; top: 0; left: 0; right: 0; height: 3px; }}
   .card.critical::before {{ background: var(--red); }}
   .card.high::before     {{ background: var(--orange); }}
   .card.medium::before   {{ background: var(--yellow); }}
   .card.low::before      {{ background: var(--blue); }}
-  .card.critical {{ border-color: var(--red-border); background: var(--red-bg); }}
+  .card.critical {{ border-color: var(--red-border);    background: var(--red-bg); }}
   .card.high     {{ border-color: var(--orange-border); background: var(--orange-bg); }}
   .card.medium   {{ border-color: var(--yellow-border); background: var(--yellow-bg); }}
-  .card.low      {{ border-color: var(--blue-border); background: var(--blue-bg); }}
+  .card.low      {{ border-color: var(--blue-border);   background: var(--blue-bg); }}
   .card-count {{ font-size: 36px; font-weight: 700; line-height: 1; margin-bottom: 6px; font-variant-numeric: tabular-nums; }}
   .card.critical .card-count {{ color: var(--red); }}
   .card.high     .card-count {{ color: var(--orange); }}
@@ -336,6 +553,21 @@ def build_html(repo, rows, stats, generated_at):
   .card.medium   .card-label {{ color: var(--yellow); }}
   .card.low      .card-label {{ color: var(--blue); }}
   .card-sub {{ font-size: 11px; color: var(--text-muted); margin-top: 4px; }}
+
+  /* ── BUMP TYPE CARDS ── */
+  .bump-cards {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 28px; }}
+  .bump-card {{ background: var(--bg-secondary); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 16px 20px; display: flex; align-items: center; gap: 14px; }}
+  .bump-icon {{ width: 36px; height: 36px; border-radius: var(--radius-md); display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 700; flex-shrink: 0; }}
+  .bump-icon.patch  {{ background: var(--green-bg);  color: var(--green);  border: 1px solid var(--green-border); }}
+  .bump-icon.minor  {{ background: var(--orange-bg); color: var(--orange); border: 1px solid var(--orange-border); }}
+  .bump-icon.major  {{ background: var(--red-bg);    color: var(--red);    border: 1px solid var(--red-border); }}
+  .bump-info {{ flex: 1; }}
+  .bump-count {{ font-size: 24px; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; }}
+  .bump-count.patch {{ color: var(--green); }}
+  .bump-count.minor {{ color: var(--orange); }}
+  .bump-count.major {{ color: var(--red); }}
+  .bump-label {{ font-size: 12px; color: var(--text-muted); margin-top: 2px; }}
+  .bump-hint  {{ font-size: 11px; color: var(--text-muted); margin-top: 2px; }}
 
   /* ── PROGRESS CARDS ── */
   .progress-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 28px; }}
@@ -356,7 +588,6 @@ def build_html(repo, rows, stats, generated_at):
   .chart-card {{ background: var(--bg-secondary); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 20px; }}
   .chart-title {{ font-size: 13px; font-weight: 600; color: var(--text-primary); margin-bottom: 16px; display: flex; align-items: center; gap: 8px; }}
   .chart-title span {{ font-size: 11px; font-weight: 400; color: var(--text-muted); }}
-
   .bar-chart {{ width: 100%; }}
   .bar-row {{ display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }}
   .bar-label {{ font-size: 12px; color: var(--text-secondary); width: 130px; flex-shrink: 0; text-align: right; font-family: "SFMono-Regular", Consolas, monospace; }}
@@ -371,7 +602,7 @@ def build_html(repo, rows, stats, generated_at):
   .donut-wrap {{ display: flex; flex-direction: column; align-items: center; gap: 20px; }}
   .donut-svg-wrap {{ position: relative; width: 160px; height: 160px; }}
   .donut-center-text {{ position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); text-align: center; pointer-events: none; }}
-  .donut-center-big {{ font-size: 28px; font-weight: 700; color: var(--text-primary); line-height: 1; }}
+  .donut-center-big   {{ font-size: 28px; font-weight: 700; color: var(--text-primary); line-height: 1; }}
   .donut-center-small {{ font-size: 11px; color: var(--text-muted); }}
   .donut-legend {{ display: flex; flex-direction: column; gap: 10px; width: 100%; }}
   .legend-item {{ display: flex; align-items: center; justify-content: space-between; gap: 8px; }}
@@ -417,7 +648,6 @@ def build_html(repo, rows, stats, generated_at):
   .table-wrap {{ background: var(--bg-secondary); border: 1px solid var(--border); border-radius: var(--radius-lg); overflow: hidden; margin-bottom: 28px; }}
   .table-scroll {{ overflow-x: auto; }}
   table {{ width: 100%; border-collapse: collapse; }}
-
   thead th {{
     background: var(--bg-tertiary); border-bottom: 1px solid var(--border);
     padding: 11px 14px; text-align: left; font-size: 11px; font-weight: 600;
@@ -428,49 +658,62 @@ def build_html(repo, rows, stats, generated_at):
   thead th:hover {{ color: var(--text-primary); }}
   thead th.sorted {{ color: var(--blue); }}
   .sort-indicator {{ margin-left: 4px; opacity: .7; }}
-
   tbody tr {{ border-bottom: 1px solid var(--border-muted); transition: background .1s; cursor: pointer; }}
   tbody tr:last-child {{ border-bottom: none; }}
   tbody tr:nth-child(even) {{ background: rgba(255,255,255,.018); }}
   tbody tr:hover {{ background: var(--bg-hover); }}
   tbody tr.expanded {{ background: var(--bg-tertiary); }}
   tbody td {{ padding: 10px 14px; vertical-align: middle; color: var(--text-primary); font-size: 13px; }}
-
   .td-id {{ font-family: "SFMono-Regular", Consolas, monospace; font-size: 12px; color: var(--text-muted); }}
   .td-id a {{ color: var(--blue); text-decoration: none; display: inline-flex; align-items: center; gap: 4px; transition: color .15s; }}
   .td-id a:hover {{ color: #6cb6ff; text-decoration: underline; }}
   .td-pkg {{ font-weight: 600; font-family: "SFMono-Regular", Consolas, monospace; font-size: 12px; }}
-
   tbody tr.done-row td {{ opacity: .55; }}
   tbody tr.done-row .td-pkg {{ text-decoration: line-through; text-decoration-color: var(--green); }}
 
   .badge {{ display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: 99px; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; white-space: nowrap; }}
-  .badge.critical {{ background: var(--red-bg); color: var(--red); border: 1px solid var(--red-border); }}
+  .badge.critical {{ background: var(--red-bg);    color: var(--red);    border: 1px solid var(--red-border); }}
   .badge.high     {{ background: var(--orange-bg); color: var(--orange); border: 1px solid var(--orange-border); }}
   .badge.medium   {{ background: var(--yellow-bg); color: var(--yellow); border: 1px solid var(--yellow-border); }}
-  .badge.low      {{ background: var(--blue-bg); color: var(--blue); border: 1px solid var(--blue-border); }}
+  .badge.low      {{ background: var(--blue-bg);   color: var(--blue);   border: 1px solid var(--blue-border); }}
+
+  .bump-badge {{ display: inline-block; padding: 1px 6px; border-radius: var(--radius-sm); font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; white-space: nowrap; }}
+  .bump-badge.patch   {{ background: var(--green-bg);  color: var(--green);  border: 1px solid var(--green-border); }}
+  .bump-badge.minor   {{ background: var(--orange-bg); color: var(--orange); border: 1px solid var(--orange-border); }}
+  .bump-badge.major   {{ background: var(--red-bg);    color: var(--red);    border: 1px solid var(--red-border); }}
+  .bump-badge.unknown {{ background: var(--gray-bg);   color: var(--text-muted); border: 1px solid var(--border); }}
+
+  .eco-badge {{ display: inline-block; padding: 1px 6px; border-radius: var(--radius-sm); font-size: 10px; font-weight: 600; white-space: nowrap; }}
+  .eco-badge.npm {{ background: #0f2a1a; color: #3fb950; border: 1px solid #1a4023; }}
+  .eco-badge.pip {{ background: var(--blue-bg); color: var(--blue); border: 1px solid var(--blue-border); }}
 
   .type-badge {{ display: inline-block; padding: 2px 8px; border-radius: 99px; font-size: 11px; font-weight: 500; white-space: nowrap; }}
   .type-badge.direct {{ background: var(--green-bg); color: var(--green); border: 1px solid var(--green-border); }}
-  .type-badge.sub    {{ background: var(--gray-bg); color: var(--text-muted); border: 1px solid var(--border); }}
+  .type-badge.sub    {{ background: var(--gray-bg);  color: var(--text-muted); border: 1px solid var(--border); }}
 
   .status-badge {{ display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: 99px; font-size: 11px; font-weight: 500; white-space: nowrap; cursor: pointer; }}
   .status-badge.todo {{ background: var(--bg-tertiary); color: var(--text-muted); border: 1px solid var(--border); }}
   .status-badge.done {{ background: var(--green-bg); color: var(--green); border: 1px solid var(--green-border); }}
 
   .cvss-pill {{ font-size: 12px; font-weight: 700; font-variant-numeric: tabular-nums; padding: 1px 6px; border-radius: var(--radius-sm); background: var(--bg-tertiary); color: var(--text-secondary); }}
-  .cvss-pill.critical {{ color: var(--red); background: var(--red-bg); }}
+  .cvss-pill.critical {{ color: var(--red);    background: var(--red-bg); }}
   .cvss-pill.high     {{ color: var(--orange); background: var(--orange-bg); }}
   .cvss-pill.medium   {{ color: var(--yellow); background: var(--yellow-bg); }}
 
+  /* ── DETAIL ROW ── */
   .detail-row td {{ padding: 0; background: var(--bg-tertiary); }}
-  .detail-content {{ padding: 16px 20px 20px; border-top: 1px solid var(--border); display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; }}
+  .detail-content {{
+    padding: 16px 20px 20px; border-top: 1px solid var(--border);
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px;
+  }}
   .detail-field label {{ font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; color: var(--text-muted); display: block; margin-bottom: 4px; }}
   .detail-field p {{ font-size: 13px; color: var(--text-primary); }}
   .detail-field.full {{ grid-column: 1 / -1; }}
   .detail-field code {{ font-family: "SFMono-Regular", Consolas, monospace; font-size: 12px; background: var(--bg-primary); padding: 2px 6px; border-radius: var(--radius-sm); color: var(--text-secondary); }}
   .action-chip {{ display: inline-block; padding: 3px 10px; border-radius: var(--radius-sm); font-size: 12px; font-weight: 600; background: var(--bg-primary); border: 1px solid var(--border); color: var(--text-secondary); }}
   .action-chip.urgent {{ background: var(--red-bg); color: var(--red); border-color: var(--red-border); }}
+  .changelog-link {{ color: var(--blue); font-size: 12px; text-decoration: none; display: inline-flex; align-items: center; gap: 4px; }}
+  .changelog-link:hover {{ text-decoration: underline; }}
 
   .empty-state {{ padding: 60px 20px; text-align: center; color: var(--text-muted); }}
   .empty-state p {{ font-size: 14px; }}
@@ -498,11 +741,9 @@ def build_html(repo, rows, stats, generated_at):
   .acc-alert-summary {{ font-size: 12px; color: var(--text-secondary); flex: 1; }}
   .acc-alert-patched {{ font-size: 11px; font-family: monospace; color: var(--text-muted); white-space: nowrap; }}
 
-  /* ── REPO BADGE ── */
   .repo-link {{ font-size: 12px; color: var(--blue); text-decoration: none; display: inline-flex; align-items: center; gap: 4px; }}
   .repo-link:hover {{ text-decoration: underline; }}
 
-  /* ── FOOTER ── */
   .footer {{ border-top: 1px solid var(--border); padding: 20px 32px; text-align: center; font-size: 12px; color: var(--text-muted); background: var(--bg-secondary); }}
 
   ::-webkit-scrollbar {{ width: 6px; height: 6px; }}
@@ -517,7 +758,7 @@ def build_html(repo, rows, stats, generated_at):
 <div class="topbar">
   <div class="topbar-icon">&#9888;</div>
   <div class="topbar-text">
-    <h1>Dependabot Vulnerability Tracker &mdash; {repo_name}</h1>
+    <h1>Dependabot Vulnerability Tracker &mdash; {label}</h1>
     <p>
       <span>{stats['total']} open alerts</span>
       &middot; Repo: <a href="https://github.com/{repo}" target="_blank" rel="noopener" class="repo-link">{repo} &#8599;</a>
@@ -532,28 +773,61 @@ def build_html(repo, rows, stats, generated_at):
 
 <div class="container">
 
-  <!-- SUMMARY CARDS -->
+  <!-- SEVERITY CARDS -->
   <div class="section-label">Severity Overview</div>
   <div class="cards-grid">
     <div class="card critical">
-      <div class="card-count" id="cnt-critical">{stats['critical']}</div>
+      <div class="card-count">{stats['critical']}</div>
       <div class="card-label">Critical</div>
       <div class="card-sub">CVSS 9.0&ndash;10.0 &middot; Fix immediately</div>
     </div>
     <div class="card high">
-      <div class="card-count" id="cnt-high">{stats['high']}</div>
+      <div class="card-count">{stats['high']}</div>
       <div class="card-label">High</div>
       <div class="card-sub">CVSS 7.0&ndash;8.9 &middot; Fix this sprint</div>
     </div>
     <div class="card medium">
-      <div class="card-count" id="cnt-medium">{stats['medium']}</div>
+      <div class="card-count">{stats['medium']}</div>
       <div class="card-label">Medium</div>
       <div class="card-sub">CVSS 4.0&ndash;6.9 &middot; Schedule fix</div>
     </div>
     <div class="card low">
-      <div class="card-count" id="cnt-low">{stats['low']}</div>
+      <div class="card-count">{stats['low']}</div>
       <div class="card-label">Low</div>
       <div class="card-sub">CVSS 0.1&ndash;3.9 &middot; Batch end-of-quarter</div>
+    </div>
+  </div>
+
+  <!-- BUMP TYPE CARDS -->
+  <div class="section-label">Version Bump Required
+    <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--text-muted);font-size:11px;">
+      &mdash; how large is the version jump to the patched release?
+    </span>
+  </div>
+  <div class="bump-cards">
+    <div class="bump-card">
+      <div class="bump-icon patch">P</div>
+      <div class="bump-info">
+        <div class="bump-count patch">{stats['patch']}</div>
+        <div class="bump-label">Patch bumps</div>
+        <div class="bump-hint">x.y.<strong>Z</strong> &mdash; low-risk, auto-merge candidates</div>
+      </div>
+    </div>
+    <div class="bump-card">
+      <div class="bump-icon minor">m</div>
+      <div class="bump-info">
+        <div class="bump-count minor">{stats['minor']}</div>
+        <div class="bump-label">Minor bumps</div>
+        <div class="bump-hint">x.<strong>Y</strong>.z &mdash; check changelog for API changes</div>
+      </div>
+    </div>
+    <div class="bump-card">
+      <div class="bump-icon major">M</div>
+      <div class="bump-info">
+        <div class="bump-count major">{stats['major']}</div>
+        <div class="bump-label">Major bumps</div>
+        <div class="bump-hint"><strong>X</strong>.y.z &mdash; breaking changes expected</div>
+      </div>
     </div>
   </div>
 
@@ -565,11 +839,9 @@ def build_html(repo, rows, stats, generated_at):
         <div class="progress-title">Direct Dependencies</div>
         <div class="progress-stats"><strong id="direct-done">0</strong> / <strong id="direct-total">{stats['direct']}</strong> resolved</div>
       </div>
-      <div class="progress-bar-wrap">
-        <div class="progress-bar-fill" id="direct-bar" style="width:0%"></div>
-      </div>
+      <div class="progress-bar-wrap"><div class="progress-bar-fill" id="direct-bar" style="width:0%"></div></div>
       <div class="progress-footnote">
-        <span><span class="dot" style="background:var(--red)"></span> Runtime critical/high: {direct_runtime_high}</span>
+        <span><span class="dot" style="background:var(--red)"></span> Runtime crit/high: {direct_runtime_high}</span>
         <span><span class="dot" style="background:var(--orange)"></span> Dev direct: {direct_dev}</span>
         <span><span class="dot" style="background:var(--yellow)"></span> Runtime medium: {direct_runtime_medium}</span>
       </div>
@@ -579,9 +851,7 @@ def build_html(repo, rows, stats, generated_at):
         <div class="progress-title">Sub-Dependencies (Transitive)</div>
         <div class="progress-stats"><strong id="sub-done">0</strong> / <strong id="sub-total">{stats['sub']}</strong> resolved</div>
       </div>
-      <div class="progress-bar-wrap">
-        <div class="progress-bar-fill" id="sub-bar" style="width:0%"></div>
-      </div>
+      <div class="progress-bar-wrap"><div class="progress-bar-fill" id="sub-bar" style="width:0%"></div></div>
       <div class="progress-footnote">
         <span><span class="dot" style="background:var(--orange)"></span> High: {sub_high}</span>
         <span><span class="dot" style="background:var(--yellow)"></span> Medium: {sub_medium}</span>
@@ -609,28 +879,20 @@ def build_html(repo, rows, stats, generated_at):
         </div>
         <div class="donut-legend">
           <div class="legend-item">
-            <div class="legend-left">
-              <div class="legend-dot" style="background:var(--red)"></div>
-              <div class="legend-label">Runtime</div>
-            </div>
+            <div class="legend-left"><div class="legend-dot" style="background:var(--red)"></div><div class="legend-label">Runtime</div></div>
             <div style="display:flex;gap:8px;align-items:baseline">
-              <div class="legend-val">{stats['runtime']}</div>
-              <div class="legend-pct">{runtime_pct}%</div>
+              <div class="legend-val">{stats['runtime']}</div><div class="legend-pct">{runtime_pct}%</div>
             </div>
           </div>
           <div class="legend-item">
-            <div class="legend-left">
-              <div class="legend-dot" style="background:var(--blue)"></div>
-              <div class="legend-label">Development</div>
-            </div>
+            <div class="legend-left"><div class="legend-dot" style="background:var(--blue)"></div><div class="legend-label">Development</div></div>
             <div style="display:flex;gap:8px;align-items:baseline">
-              <div class="legend-val">{stats['dev']}</div>
-              <div class="legend-pct">{dev_pct}%</div>
+              <div class="legend-val">{stats['dev']}</div><div class="legend-pct">{dev_pct}%</div>
             </div>
           </div>
           <div style="margin-top:8px;padding:10px;background:var(--bg-tertiary);border-radius:var(--radius-md);border:1px solid var(--border)">
             <div style="font-size:11px;color:var(--text-muted);margin-bottom:4px;">Prioritization note</div>
-            <div style="font-size:12px;color:var(--text-secondary);">Runtime vulnerabilities affect production users. Dev-only alerts in CI/build tools carry lower real-world risk.</div>
+            <div style="font-size:12px;color:var(--text-secondary);">Runtime vulnerabilities affect production users. Dev-only alerts carry lower real-world risk.</div>
           </div>
         </div>
       </div>
@@ -658,6 +920,23 @@ def build_html(repo, rows, stats, generated_at):
       </select>
     </div>
     <div class="filter-group">
+      <label>Bump</label>
+      <select id="filter-bump">
+        <option value="">All bumps</option>
+        <option value="patch">Patch (safe)</option>
+        <option value="minor">Minor</option>
+        <option value="major">Major</option>
+      </select>
+    </div>
+    <div class="filter-group">
+      <label>Ecosystem</label>
+      <select id="filter-eco">
+        <option value="">All ecosystems</option>
+        <option value="npm">npm</option>
+        <option value="pip">pip</option>
+      </select>
+    </div>
+    <div class="filter-group">
       <label>Status</label>
       <select id="filter-status">
         <option value="">All statuses</option>
@@ -675,7 +954,7 @@ def build_html(repo, rows, stats, generated_at):
     </div>
     <div class="search-wrap">
       <span class="search-icon">&#128269;</span>
-      <input type="text" class="search-input" id="search-input" placeholder="Search package, summary..." />
+      <input type="text" class="search-input" id="search-input" placeholder="Search package, function, summary..." />
     </div>
     <div class="filter-count" id="filter-count">Showing <strong>{stats['total']}</strong> of {stats['total']} alerts</div>
     <button class="btn-clear" id="btn-clear">Clear filters</button>
@@ -691,6 +970,7 @@ def build_html(repo, rows, stats, generated_at):
             <th data-col="package">Package</th>
             <th data-col="severity">Severity</th>
             <th data-col="cvss">CVSS</th>
+            <th data-col="bumpType">Bump</th>
             <th data-col="depType">Type</th>
             <th data-col="scope">Scope</th>
             <th data-col="action">Action</th>
@@ -721,7 +1001,7 @@ def build_html(repo, rows, stats, generated_at):
 
 <script>
 const REPO = '{repo}';
-const RAW = {js_data};
+const RAW  = {js_data};
 
 const TOTAL_DIRECT = {stats['direct']};
 const TOTAL_SUB    = {stats['sub']};
@@ -736,22 +1016,37 @@ function getStatus(row) {{
   return statusOverrides[row.alertId] !== undefined ? statusOverrides[row.alertId] : row.status;
 }}
 
+// ── FILTERING ────────────────────────────────────────────────
+// Multi-dimensional filter: severity + type + bump + ecosystem + status + scope + free-text search.
+// All filters are AND-combined (each narrows the result set further).
+// Free-text searches pkg name, functionName, and summary (case-insensitive substring).
 function getFiltered() {{
   const sev    = document.getElementById('filter-severity').value;
   const type   = document.getElementById('filter-type').value;
+  const bump   = document.getElementById('filter-bump').value;
+  const eco    = document.getElementById('filter-eco').value;
   const status = document.getElementById('filter-status').value;
   const scope  = document.getElementById('filter-scope').value;
   const q      = document.getElementById('search-input').value.toLowerCase().trim();
+
   return RAW.filter(r => {{
-    if (sev    && r.severity !== sev)          return false;
-    if (type   && r.depType  !== type)         return false;
-    if (scope  && r.scope    !== scope)        return false;
-    if (status && getStatus(r) !== status)     return false;
-    if (q && !r.pkg.toLowerCase().includes(q) && !r.summary.toLowerCase().includes(q)) return false;
+    if (sev    && r.severity          !== sev)    return false;
+    if (type   && r.depType           !== type)   return false;
+    if (bump   && r.bumpType          !== bump)   return false;
+    if (eco    && r.eco               !== eco)    return false;
+    if (scope  && r.scope             !== scope)  return false;
+    if (status && getStatus(r)        !== status) return false;
+    if (q) {{
+      const haystack = [r.pkg, r.functionName, r.summary].join(' ').toLowerCase();
+      if (!haystack.includes(q)) return false;
+    }}
     return true;
   }});
 }}
 
+// ── SORTING ──────────────────────────────────────────────────
+// Numeric columns sort numerically; string columns use localeCompare.
+// 'status' resolves through statusOverrides map.
 function getSorted(data) {{
   return [...data].sort((a, b) => {{
     let av = a[sortCol], bv = b[sortCol];
@@ -762,7 +1057,7 @@ function getSorted(data) {{
   }});
 }}
 
-function sevClass(s) {{ return s.toLowerCase(); }}
+function sevClass(s)  {{ return s.toLowerCase(); }}
 function cvssClass(cvss, sev) {{
   if (sev === 'CRITICAL') return 'critical';
   if (cvss >= 7) return 'high';
@@ -773,13 +1068,12 @@ function cvssDisplay(cvss) {{ return cvss > 0 ? cvss.toFixed(1) : 'N/A'; }}
 function escHtml(s) {{
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }}
-
 function alertUrl(alertId) {{
   return `https://github.com/${{REPO}}/security/dependabot/${{alertId.replace('#','')}}`;
 }}
 const LINK_ICON = `<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>`;
 
-// ── TABLE ──
+// ── TABLE ────────────────────────────────────────────────────
 function renderTable() {{
   const filtered = getFiltered();
   const sorted   = getSorted(filtered);
@@ -788,7 +1082,7 @@ function renderTable() {{
     `Showing <strong>${{filtered.length}}</strong> of ${{RAW.length}} alerts`;
 
   if (sorted.length === 0) {{
-    tbody.innerHTML = `<tr><td colspan="8"><div class="empty-state"><p>No alerts match the current filters.</p></div></td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="9"><div class="empty-state"><p>No alerts match the current filters.</p></div></td></tr>`;
     return;
   }}
 
@@ -799,11 +1093,15 @@ function renderTable() {{
     const doneClass  = isDone ? ' done-row' : '';
     const expClass   = isExpanded ? ' expanded' : '';
 
+    const ecoTag  = r.eco ? `<span class="eco-badge ${{r.eco}}">${{escHtml(r.eco)}}</span>` : '';
+    const fnTag   = r.functionName ? `<span style="font-size:10px;color:var(--text-muted);display:block;margin-top:2px">${{escHtml(r.functionName)}}</span>` : '';
+
     rows.push(`<tr class="data-row${{doneClass}}${{expClass}}" data-id="${{r.alertId}}">
       <td class="td-id"><a href="${{alertUrl(r.alertId)}}" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="Open on GitHub">${{r.alertId}}${{LINK_ICON}}</a></td>
-      <td class="td-pkg">${{escHtml(r.pkg)}}</td>
+      <td class="td-pkg">${{escHtml(r.pkg)}}${{ecoTag}}${{fnTag}}</td>
       <td><span class="badge ${{sevClass(r.severity)}}">${{r.severity}}</span></td>
       <td><span class="cvss-pill ${{cvssClass(r.cvss, r.severity)}}">${{cvssDisplay(r.cvss)}}</span></td>
+      <td><span class="bump-badge ${{r.bumpType}}">${{r.bumpType}}</span></td>
       <td><span class="type-badge ${{r.depType === 'direct' ? 'direct' : 'sub'}}">${{r.depType === 'direct' ? 'direct' : 'sub-dep'}}</span></td>
       <td style="font-size:11px;color:var(--text-muted)">${{r.scope}}</td>
       <td style="font-size:12px;color:var(--text-secondary);max-width:180px;">${{escHtml(r.action)}}</td>
@@ -813,8 +1111,16 @@ function renderTable() {{
     </tr>`);
 
     if (isExpanded) {{
+      const changelogLink = r.changelogUrl
+        ? `<a href="${{escHtml(r.changelogUrl)}}" target="_blank" rel="noopener" class="changelog-link">View changelog ${{LINK_ICON}}</a>`
+        : '<span style="color:var(--text-muted)">N/A</span>';
+
+      const fnField = r.functionName
+        ? `<div class="detail-field"><label>Function</label><p><code>${{escHtml(r.functionName)}}</code></p></div>`
+        : '';
+
       rows.push(`<tr class="detail-row" data-detail="${{r.alertId}}">
-        <td colspan="8">
+        <td colspan="9">
           <div class="detail-content">
             <div class="detail-field full"><label>Summary</label><p>${{escHtml(r.summary)}}</p></div>
             <div class="detail-field">
@@ -827,12 +1133,17 @@ function renderTable() {{
             </div>
             <div class="detail-field"><label>Package</label><p><code>${{escHtml(r.pkg)}}</code></p></div>
             <div class="detail-field"><label>Patched Version</label><p><code>${{escHtml(r.patched)}}</code></p></div>
+            <div class="detail-field"><label>Vulnerable Range</label><p><code>${{escHtml(r.vulnRange)}}</code></p></div>
+            <div class="detail-field"><label>Bump Type</label><p><span class="bump-badge ${{r.bumpType}}">${{r.bumpType}}</span></p></div>
+            <div class="detail-field"><label>Ecosystem</label><p><span class="eco-badge ${{r.eco}}">${{r.eco}}</span></p></div>
+            ${{fnField}}
             <div class="detail-field"><label>Scope</label><p>${{r.scope}}</p></div>
             <div class="detail-field"><label>Manifest</label><p><code>${{escHtml(r.manifest)}}</code></p></div>
             <div class="detail-field"><label>Priority</label><p>${{r.priority}}</p></div>
             <div class="detail-field"><label>Recommended Action</label>
               <p><span class="action-chip ${{r.action === 'FIX NOW' ? 'urgent' : ''}}">${{escHtml(r.action)}}</span></p>
             </div>
+            <div class="detail-field"><label>Changelog</label><p>${{changelogLink}}</p></div>
           </div>
         </td>
       </tr>`);
@@ -860,7 +1171,7 @@ function toggleStatus(alertId) {{
   renderAccordion();
 }}
 
-// ── SORT ──
+// ── SORT ─────────────────────────────────────────────────────
 document.querySelectorAll('thead th[data-col]').forEach(th => {{
   th.addEventListener('click', () => {{
     const col = th.dataset.col;
@@ -880,12 +1191,12 @@ document.querySelectorAll('thead th[data-col]').forEach(th => {{
   }});
 }});
 
-// ── FILTERS ──
-['filter-severity','filter-type','filter-status','filter-scope','search-input'].forEach(id => {{
+// ── FILTER LISTENERS ─────────────────────────────────────────
+['filter-severity','filter-type','filter-bump','filter-eco','filter-status','filter-scope','search-input'].forEach(id => {{
   document.getElementById(id).addEventListener('input', () => {{ expandedRows.clear(); renderTable(); }});
 }});
 document.getElementById('btn-clear').addEventListener('click', () => {{
-  ['filter-severity','filter-type','filter-status','filter-scope'].forEach(id => {{
+  ['filter-severity','filter-type','filter-bump','filter-eco','filter-status','filter-scope'].forEach(id => {{
     document.getElementById(id).value = '';
   }});
   document.getElementById('search-input').value = '';
@@ -893,7 +1204,7 @@ document.getElementById('btn-clear').addEventListener('click', () => {{
   renderTable();
 }});
 
-// ── BAR CHART ──
+// ── BAR CHART ────────────────────────────────────────────────
 function renderBarChart() {{
   const pkgCounts = {{}};
   RAW.forEach(r => {{ pkgCounts[r.pkg] = (pkgCounts[r.pkg] || 0) + 1; }});
@@ -905,8 +1216,8 @@ function renderBarChart() {{
     const pct = Math.round((count / max) * 100);
     const pkgAlerts = RAW.filter(r => r.pkg === pkg);
     const topSev = pkgAlerts.some(r => r.severity === 'CRITICAL') ? 'critical'
-                 : pkgAlerts.some(r => r.severity === 'HIGH') ? 'high'
-                 : pkgAlerts.some(r => r.severity === 'MEDIUM') ? 'medium' : 'mixed';
+                 : pkgAlerts.some(r => r.severity === 'HIGH')     ? 'high'
+                 : pkgAlerts.some(r => r.severity === 'MEDIUM')   ? 'medium' : 'mixed';
     const row = document.createElement('div');
     row.className = 'bar-row';
     row.innerHTML = `
@@ -917,14 +1228,16 @@ function renderBarChart() {{
   }});
 }}
 
-// ── DONUT CHART ──
+// ── DONUT CHART ──────────────────────────────────────────────
 function renderDonut() {{
   const runtime = RAW.filter(r => r.scope === 'runtime').length;
   const dev     = RAW.filter(r => r.scope === 'development').length;
   const total   = runtime + dev;
+  if (!total) return;
   const svg = document.getElementById('donut-svg');
   const cx = 80, cy = 80, r = 60, sw = 22;
   function makeArc(startFrac, endFrac, color) {{
+    if (endFrac <= startFrac) return;
     const startAngle = startFrac * 2 * Math.PI - Math.PI / 2;
     const endAngle   = endFrac   * 2 * Math.PI - Math.PI / 2;
     const x1 = cx + r * Math.cos(startAngle);
@@ -945,7 +1258,7 @@ function renderDonut() {{
   makeArc(runtimeFrac + 0.01, 1, '#388bfd');
 }}
 
-// ── ACCORDION ──
+// ── ACCORDION ────────────────────────────────────────────────
 function renderAccordion() {{
   const container = document.getElementById('accordion-container');
   const pkgMap = {{}};
@@ -955,13 +1268,21 @@ function renderAccordion() {{
 
   for (const [pkg, alerts] of sortedPkgs) {{
     const doneCount = alerts.filter(r => getStatus(r) === 'Done').length;
-    const sevOrder = {{CRITICAL:0,HIGH:1,MEDIUM:2,LOW:3}};
-    const sevs = [...new Set(alerts.map(r => r.severity))].sort((a,b) => (sevOrder[a]||9)-(sevOrder[b]||9));
-    const isOpen = openStates[pkg] || false;
-    const pct = Math.round((doneCount / alerts.length) * 100);
-    const miniBar = doneCount > 0
+    const sevOrder  = {{CRITICAL:0,HIGH:1,MEDIUM:2,LOW:3}};
+    const sevs      = [...new Set(alerts.map(r => r.severity))].sort((a,b) => (sevOrder[a]||9)-(sevOrder[b]||9));
+    const isOpen    = openStates[pkg] || false;
+    const pct       = Math.round((doneCount / alerts.length) * 100);
+    const miniBar   = doneCount > 0
       ? `<div style="width:60px;height:4px;background:var(--bg-primary);border-radius:99px;overflow:hidden;display:inline-block;vertical-align:middle;margin-left:6px"><div style="height:100%;width:${{pct}}%;background:var(--green);border-radius:99px"></div></div>`
       : '';
+
+    // Bump type summary for this package
+    const bumps = [...new Set(alerts.map(r => r.bumpType).filter(b => b && b !== 'unknown'))];
+    const bumpTags = bumps.map(b => `<span class="bump-badge ${{b}}" style="font-size:9px">${{b}}</span>`).join(' ');
+
+    // Changelog link for this package
+    const clUrl = alerts[0]?.changelogUrl || '';
+    const clLink = clUrl ? `<a href="${{escHtml(clUrl)}}" target="_blank" rel="noopener" onclick="event.stopPropagation()" class="changelog-link" style="font-size:11px">changelog ${{LINK_ICON}}</a>` : '';
 
     const item = document.createElement('div');
     item.className = `accordion-item${{isOpen ? ' open' : ''}}`;
@@ -972,6 +1293,7 @@ function renderAccordion() {{
         <div class="accordion-pkg">${{escHtml(pkg)}}</div>
         <span class="accordion-count">${{alerts.length}} alert${{alerts.length>1?'s':''}}</span>
         <div class="accordion-severity-row">${{sevs.map(s=>`<span class="badge ${{sevClass(s)}}" style="font-size:10px;padding:1px 6px">${{s}}</span>`).join('')}}</div>
+        <div style="display:flex;gap:6px;align-items:center">${{bumpTags}}${{clLink}}</div>
         <div class="accordion-impact"><strong>${{doneCount}}/${{alerts.length}}</strong> resolved${{miniBar}}</div>
         <div class="accordion-chevron">&#9660;</div>
       </div>
@@ -979,10 +1301,12 @@ function renderAccordion() {{
         <div class="acc-alert-list">
           ${{alerts.map(r => {{
             const isDone = getStatus(r) === 'Done';
+            const fn = r.functionName ? `<span style="font-size:10px;color:var(--text-muted);margin-left:6px">[${{escHtml(r.functionName)}}]</span>` : '';
             return `<div class="acc-alert" style="${{isDone ? 'opacity:.5' : ''}}">
               <div class="acc-alert-id"><a href="${{alertUrl(r.alertId)}}" target="_blank" rel="noopener" onclick="event.stopPropagation()">${{r.alertId}}</a></div>
               <span class="badge ${{sevClass(r.severity)}}" style="font-size:10px;padding:1px 6px;flex-shrink:0">${{r.severity}}</span>
-              <div class="acc-alert-summary" style="${{isDone ? 'text-decoration:line-through' : ''}}">${{escHtml(r.summary)}}</div>
+              <span class="bump-badge ${{r.bumpType}}" style="flex-shrink:0">${{r.bumpType}}</span>
+              <div class="acc-alert-summary" style="${{isDone ? 'text-decoration:line-through' : ''}}">${{escHtml(r.summary)}}${{fn}}</div>
               <div class="acc-alert-patched">&#8594; ${{escHtml(r.patched)}}</div>
             </div>`;
           }}).join('')}}
@@ -998,7 +1322,7 @@ function renderAccordion() {{
   }}
 }}
 
-// ── PROGRESS ──
+// ── PROGRESS ─────────────────────────────────────────────────
 function updateProgressCards() {{
   const directs = RAW.filter(r => r.depType === 'direct');
   const subs    = RAW.filter(r => r.depType === 'sub-dependency');
@@ -1010,7 +1334,7 @@ function updateProgressCards() {{
   document.getElementById('sub-bar').style.width     = TOTAL_SUB    ? `${{Math.round(subDone/TOTAL_SUB*100)}}%`       : '0%';
 }}
 
-// ── INIT ──
+// ── INIT ─────────────────────────────────────────────────────
 renderBarChart();
 renderDonut();
 renderTable();
@@ -1024,25 +1348,57 @@ updateProgressCards();
 # ─────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────
-def main():
-    repo = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_REPO
-    print(f"\nDependabot Dashboard Generator")
-    print(f"  Repo: {repo}")
 
-    alerts = fetch_alerts(repo)
-    direct_deps = load_direct_deps(PACKAGE_JSON_PATH)
-    rows = classify(alerts, direct_deps)
-    stats = compute_stats(rows)
-    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+def _parse_args() -> str:
+    """Parse CLI args. Returns repo string."""
+    args = sys.argv[1:]
+    if not args:
+        return DEFAULT_REPO
+    if args[0] in ("--repo", "-r") and len(args) > 1:
+        return args[1]
+    # Positional
+    if not args[0].startswith("--"):
+        return args[0]
+    return DEFAULT_REPO
+
+
+def main() -> None:
+    repo = _parse_args()
+
+    cfg = REPO_CONFIGS.get(repo)
+    if not cfg:
+        print(f"WARNING: No config entry for '{repo}'. Using generic defaults.")
+        cfg = {
+            "label":      repo.split("/")[-1],
+            "local_path": "",
+            "deps_mode":  "unknown",
+            "output":     _PROJECT_ROOT / "vulnerability-tracker" / "dashboard.html",
+        }
+
+    label  = cfg["label"]
+    output = Path(cfg["output"])
+
+    print(f"\nDependabot Dashboard Generator")
+    print(f"  Repo:   {repo}")
+    print(f"  Label:  {label}")
+    print(f"  Output: {output}")
+
+    alerts      = fetch_alerts(repo)
+    direct_deps = load_direct_deps(cfg)
+    rows        = classify(alerts, direct_deps)
+    stats       = compute_stats(rows)
+    generated   = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     print(f"  Stats: {stats['critical']} CRITICAL / {stats['high']} HIGH / {stats['medium']} MEDIUM / {stats['low']} LOW")
-    print(f"  Direct: {stats['direct']} / Sub-dep: {stats['sub']}")
+    print(f"  Deps:  {stats['direct']} direct / {stats['sub']} sub-deps")
+    print(f"  Bumps: {stats['patch']} patch / {stats['minor']} minor / {stats['major']} major")
 
-    html = build_html(repo, rows, stats, generated_at)
-    OUTPUT_PATH.write_text(html, encoding="utf-8")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    html = build_html(repo, label, rows, stats, generated)
+    output.write_text(html, encoding="utf-8")
 
-    print(f"\n  Dashboard written to: {OUTPUT_PATH}")
-    print(f"  Size: {len(html) // 1024} KB")
+    print(f"\n  Dashboard written → {output}")
+    print(f"  Size: {len(html) // 1024} KB\n")
 
 
 if __name__ == "__main__":
