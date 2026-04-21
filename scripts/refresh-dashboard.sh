@@ -11,7 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo " Dependabot Dashboard — Angular Portal"
+echo " Dependabot Dashboard — Lambda Functions"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 if ! gh auth status &>/dev/null; then
@@ -19,9 +19,9 @@ if ! gh auth status &>/dev/null; then
   exit 1
 fi
 
-python3 "$SCRIPT_DIR/generate-dashboard.py" mobstac-private/beaconstac_angular_portal
+python3 "$SCRIPT_DIR/generate-dashboard.py" mobstac-private/beaconstac_lambda_functions
 
-DASHBOARD="$SCRIPT_DIR/../vulnerability-tracker/dashboard.html"
+DASHBOARD="$SCRIPT_DIR/../vulnerability-tracker/lambda-dashboard.html"
 if [ -f "$DASHBOARD" ]; then
   echo "  Opening dashboard in browser..."
   open "$DASHBOARD"
