@@ -19,9 +19,11 @@ import json
 import re
 import subprocess
 import sys
-import os
 from datetime import datetime, timezone
 from pathlib import Path
+
+from analyze_alert import score_alert, enrich_alert_scores, SCORE_WEIGHTS, load_deep_cache
+from git_blame_lookup import get_last_author
 
 
 # ─────────────────────────────────────────────────────────────
@@ -52,17 +54,6 @@ DEFAULT_REPO = "mobstac-private/beaconstac_angular_portal"
 # ── Severity / Priority tables ───────────────────────────────
 
 SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
-
-ACTION_MAP = {
-    ("CRITICAL", "direct"):         "FIX NOW",
-    ("CRITICAL", "sub-dependency"): "FIX NOW",
-    ("HIGH",     "direct"):         "FIX - direct",
-    ("HIGH",     "sub-dependency"): "FIX - sub-dep",
-    ("MEDIUM",   "direct"):         "FIX - medium direct",
-    ("MEDIUM",   "sub-dependency"): "DEFER or ignore if dev-only",
-    ("LOW",      "direct"):         "BATCH end of quarter",
-    ("LOW",      "sub-dependency"): "BATCH end of quarter",
-}
 
 PRIORITY_MAP = {
     ("CRITICAL", "direct"):         1,
@@ -301,7 +292,7 @@ def _current_version_from_range(vuln_range: str) -> str:
 # CLASSIFY & SORT
 # ─────────────────────────────────────────────────────────────
 
-def classify(alerts: list[dict], direct_deps: set[str]) -> list[dict]:
+def classify(alerts: list[dict], direct_deps: set[str], repo_cfg: dict | None = None) -> list[dict]:
     """Parse raw Dependabot alert dicts into dashboard row dicts."""
     print("  Classifying alerts and enriching metadata...")
 
@@ -338,12 +329,15 @@ def classify(alerts: list[dict], direct_deps: set[str]) -> list[dict]:
         pkg_lookup = pkg.lower().replace("-", "_") if ecosystem == "pip" else pkg
         dep_type   = "direct" if (pkg in direct_deps or pkg_lookup in direct_deps) else "sub-dependency"
 
-        action   = ACTION_MAP.get((severity, dep_type), "REVIEW")
         priority = PRIORITY_MAP.get((severity, dep_type), 9)
 
         bump_type     = _parse_bump_type(vuln_range, patched)
         function_name = _function_name_from_manifest(manifest)
         vuln_range_display = _current_version_from_range(vuln_range)
+
+        # Blame signal: who last touched this Lambda function dir
+        local_path = (repo_cfg or {}).get("local_path", "")
+        last_author = get_last_author(local_path, function_name) if function_name and local_path else ""
 
         if ecosystem == "npm":
             changelog_url = _changelog_cache.get(("npm", pkg), f"https://www.npmjs.com/package/{pkg}?activeTab=versions")
@@ -364,10 +358,10 @@ def classify(alerts: list[dict], direct_deps: set[str]) -> list[dict]:
             "patched":      patched,
             "vulnRange":    vuln_range_display,
             "summary":      summary,
-            "action":       action,
             "priority":     priority,
             "bumpType":     bump_type,
             "functionName": function_name,
+            "lastAuthor":   last_author,
             "changelogUrl": changelog_url,
             "status":       "To Do",
             "notes":        "",
@@ -376,6 +370,13 @@ def classify(alerts: list[dict], direct_deps: set[str]) -> list[dict]:
 
     rows.sort(key=lambda r: (r["priority"], -r["cvss"], r["pkg"]))
     return rows
+
+
+# ─────────────────────────────────────────────────────────────
+# PER-ALERT SCORING — imported from analyze_alert.py
+# See: scripts/analyze_alert.py for weights, scoring logic, and
+# optional LLM enrichment via Claude API.
+# ─────────────────────────────────────────────────────────────
 
 
 # ─────────────────────────────────────────────────────────────
@@ -399,6 +400,8 @@ def compute_stats(rows: list[dict]) -> dict:
     }
 
 
+
+
 # ─────────────────────────────────────────────────────────────
 # JS DATA ARRAY
 # ─────────────────────────────────────────────────────────────
@@ -409,16 +412,28 @@ def rows_to_js(rows: list[dict]) -> str:
         def esc(s: object) -> str:
             return str(s).replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
 
+        # Deep analysis: embed as JSON object literal or null
+        deep = r.get("aiDeepAnalysis")
+        if deep:
+            deep_json = json.dumps(deep, ensure_ascii=False)
+        else:
+            deep_json = "null"
+
         parts.append(
             f'  {{alertId:"{esc(r["alertId"])}",pkg:"{esc(r["pkg"])}",eco:"{esc(r["eco"])}",'
             f'severity:"{esc(r["severity"])}",cvss:{r["cvss"]},scope:"{esc(r["scope"])}",'
             f'manifest:"{esc(r["manifest"])}",depType:"{esc(r["depType"])}",'
             f'patched:"{esc(r["patched"])}",vulnRange:"{esc(r["vulnRange"])}",'
             f'summary:"{esc(r["summary"])}",'
-            f'action:"{esc(r["action"])}",priority:{r["priority"]},'
+            f'priority:{r["priority"]},'
             f'bumpType:"{esc(r["bumpType"])}",'
             f'functionName:"{esc(r["functionName"])}",'
+            f'lastAuthor:"{esc(r.get("lastAuthor", ""))}",'
             f'changelogUrl:"{esc(r["changelogUrl"])}",'
+            f'aiScore:{r.get("aiScore", 0)},'
+            f'aiGrade:"{esc(r.get("aiGrade", "good"))}",'
+            f'aiReason:"{esc(r.get("aiReason", ""))}",'
+            f'aiDeepAnalysis:{deep_json},'
             f'status:"To Do",notes:"",resolvedAt:""}}'
         )
     return "[\n" + ",\n".join(parts) + "\n]"
@@ -765,8 +780,6 @@ def build_html(repo: str, label: str, rows: list[dict], stats: dict, generated_a
   .detail-field p {{ font-size: 13px; color: var(--text-primary); }}
   .detail-field.full {{ grid-column: 1 / -1; }}
   .detail-field code {{ font-family: "SFMono-Regular", Consolas, monospace; font-size: 12px; background: var(--bg-primary); padding: 2px 6px; border-radius: var(--radius-sm); color: var(--text-secondary); }}
-  .action-chip {{ display: inline-block; padding: 3px 10px; border-radius: var(--radius-sm); font-size: 12px; font-weight: 600; background: var(--bg-primary); border: 1px solid var(--border); color: var(--text-secondary); }}
-  .action-chip.urgent {{ background: var(--red-bg); color: var(--red); border-color: var(--red-border); }}
   .changelog-link {{ color: var(--blue); font-size: 12px; text-decoration: none; display: inline-flex; align-items: center; gap: 4px; }}
   .changelog-link:hover {{ text-decoration: underline; }}
 
@@ -795,6 +808,84 @@ def build_html(repo: str, label: str, rows: list[dict], stats: dict, generated_a
   .acc-alert-id a:hover {{ text-decoration: underline; }}
   .acc-alert-summary {{ font-size: 12px; color: var(--text-secondary); flex: 1; }}
   .acc-alert-patched {{ font-size: 11px; font-family: monospace; color: var(--text-muted); white-space: nowrap; }}
+
+  /* ── AI SCORE BADGE (table column) — merge-safety 0–10 ── */
+  /* good(8-10) = green = safe to merge; danger(0-2) = red = block */
+  .ai-score-badge {{
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 34px; height: 20px; border-radius: var(--radius-sm);
+    font-size: 11px; font-weight: 700; border: 1px solid; font-variant-numeric: tabular-nums;
+  }}
+  .ai-score-badge.good   {{ background: var(--green-bg);  color: var(--green);  border-color: var(--green-border); }}
+  .ai-score-badge.warn   {{ background: var(--yellow-bg); color: var(--yellow); border-color: var(--yellow-border); }}
+  .ai-score-badge.alert  {{ background: var(--orange-bg); color: var(--orange); border-color: var(--orange-border); }}
+  .ai-score-badge.danger {{ background: var(--red-bg);    color: var(--red);    border-color: var(--red-border); }}
+
+  /* ── AI DETAIL BLOCK (expanded row) ── */
+  .ai-detail-block {{
+    grid-column: 1 / -1;
+    background: var(--bg-primary); border: 1px solid var(--border);
+    border-radius: var(--radius-md); padding: 14px 16px;
+    margin-top: 4px;
+  }}
+  .ai-detail-header {{
+    display: flex; align-items: center; gap: 10px; margin-bottom: 10px;
+  }}
+  .ai-detail-label {{
+    font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .08em;
+    color: var(--text-muted);
+  }}
+  .ai-grade-chip-sm {{
+    font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em;
+    padding: 2px 8px; border-radius: 99px; border: 1px solid;
+  }}
+  .ai-grade-chip-sm.good   {{ color: var(--green);  background: var(--green-bg);  border-color: var(--green-border); }}
+  .ai-grade-chip-sm.warn   {{ color: var(--yellow); background: var(--yellow-bg); border-color: var(--yellow-border); }}
+  .ai-grade-chip-sm.alert  {{ color: var(--orange); background: var(--orange-bg); border-color: var(--orange-border); }}
+  .ai-grade-chip-sm.danger {{ color: var(--red);    background: var(--red-bg);    border-color: var(--red-border); }}
+  .ai-score-num {{ font-size: 18px; font-weight: 700; line-height: 1; }}
+  .ai-score-num.good   {{ color: var(--green); }}
+  .ai-score-num.warn   {{ color: var(--yellow); }}
+  .ai-score-num.alert  {{ color: var(--orange); }}
+  .ai-score-num.danger {{ color: var(--red); }}
+  .ai-detail-reason {{ font-size: 12px; color: var(--text-secondary); line-height: 1.7; }}
+  .ai-detail-reason p {{ margin-bottom: 6px; }}
+  .ai-detail-reason p:last-child {{ margin-bottom: 0; }}
+
+  /* ── AI DEEP ANALYSIS BLOCK ── */
+  .ai-deep-block {{
+    grid-column: 1 / -1;
+    background: linear-gradient(180deg, var(--purple-bg) 0%, var(--bg-primary) 100%);
+    border: 1px solid var(--purple-border);
+    border-radius: var(--radius-md); padding: 16px 18px;
+    margin-top: 8px;
+  }}
+  .ai-deep-header {{
+    display: flex; align-items: center; gap: 10px; margin-bottom: 14px;
+    padding-bottom: 10px; border-bottom: 1px solid var(--purple-border);
+  }}
+  .ai-deep-label {{
+    font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em;
+    color: var(--purple);
+  }}
+  .ai-deep-tag {{
+    font-size: 9px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase;
+    padding: 2px 6px; border-radius: 99px;
+    background: var(--bg-primary); color: var(--text-muted);
+    border: 1px solid var(--border);
+  }}
+  .ai-deep-section {{ margin-bottom: 12px; }}
+  .ai-deep-section:last-child {{ margin-bottom: 0; }}
+  .ai-deep-heading {{
+    font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em;
+    color: var(--text-primary); margin-bottom: 6px;
+  }}
+  .ai-deep-section p {{ font-size: 12.5px; color: var(--text-secondary); line-height: 1.6; }}
+  .ai-deep-section ul, .ai-deep-section ol {{
+    padding-left: 20px; color: var(--text-secondary);
+    font-size: 12.5px; line-height: 1.65;
+  }}
+  .ai-deep-section li {{ margin-bottom: 4px; }}
 
   .repo-link {{ font-size: 12px; color: var(--blue); text-decoration: none; display: inline-flex; align-items: center; gap: 4px; }}
   .repo-link:hover {{ text-decoration: underline; }}
@@ -1053,6 +1144,29 @@ def build_html(repo: str, label: str, rows: list[dict], stats: dict, generated_a
         <option value="development">Development</option>
       </select>
     </div>
+    <div class="filter-group">
+      <label>Safety</label>
+      <div class="tooltip-wrap">
+        <span class="info-icon">?</span>
+        <div class="tooltip-box">
+          <strong>Merge Safety Score (0–10)</strong>
+          Higher = lower risk = safer to merge first.<br/><br/>
+          <ul>
+            <li><b style="color:var(--green)">Safe to merge</b> — 8–10. Patch bump, dev-only or low severity. Go ahead.</li>
+            <li><b style="color:var(--yellow)">Review first</b> — 5–7. Minor bump or medium severity. Check changelog.</li>
+            <li><b style="color:var(--orange)">Needs attention</b> — 3–4. High severity or major bump. Plan upgrade.</li>
+            <li><b style="color:var(--red)">Block / fix first</b> — 0–2. Critical/high, runtime, complex bump. Don't merge until fixed.</li>
+          </ul>
+        </div>
+      </div>
+      <select id="filter-risk">
+        <option value="">All risk levels</option>
+        <option value="good">Safe to merge (8–10)</option>
+        <option value="warn">Review first (5–7)</option>
+        <option value="alert">Needs attention (3–4)</option>
+        <option value="danger">Block / fix first (0–2)</option>
+      </select>
+    </div>
     <div class="search-wrap">
       <span class="search-icon">&#128269;</span>
       <input type="text" class="search-input" id="search-input" placeholder="Search package, function, summary..." />
@@ -1074,7 +1188,7 @@ def build_html(repo: str, label: str, rows: list[dict], stats: dict, generated_a
             <th data-col="bumpType">Bump</th>
             <th data-col="depType">Type</th>
             <th data-col="scope">Scope</th>
-            <th data-col="action">Action</th>
+            <th data-col="aiScore">Safety</th>
             <th data-col="status">Status</th>
           </tr>
         </thead>
@@ -1117,8 +1231,59 @@ function getStatus(row) {{
   return statusOverrides[row.alertId] !== undefined ? statusOverrides[row.alertId] : row.status;
 }}
 
+// ── SCORE CONFIG ─────────────────────────────────────────────
+// Merge-safety score: 0–10. Higher = safer to merge first.
+// good(8-10) = green = low risk; danger(0-2) = red = block.
+// Scores pre-computed by Python _SCORE_WEIGHTS in generate-dashboard.py.
+// To adjust: edit _SCORE_WEIGHTS there and re-run.
+const SCORE_CONFIG = {{
+  grades: {{
+    good:   {{ min: 8, label: 'Safe to merge',    color: 'var(--green)' }},
+    warn:   {{ min: 5, label: 'Review first',      color: 'var(--yellow)' }},
+    alert:  {{ min: 3, label: 'Needs attention',   color: 'var(--orange)' }},
+    danger: {{ min: 0, label: 'Block / fix first', color: 'var(--red)' }},
+  }},
+}};
+
+function gradeLabel(grade) {{ return (SCORE_CONFIG.grades[grade] || {{}}).label || grade; }}
+function gradeColor(grade) {{ return (SCORE_CONFIG.grades[grade] || {{}}).color || 'var(--text-muted)'; }}
+
+// ── DEEP ANALYSIS RENDER ─────────────────────────────────────
+// Called when a row has aiDeepAnalysis populated by run_deep_analysis.py.
+// Deep analysis has 5 sections: summary, affected, risks, testing, flow.
+function renderDeepAnalysis(d) {{
+  if (!d) return '';
+  const list = (arr) => (arr || []).map(x => `<li>${{escHtml(x)}}</li>`).join('');
+  return `<div class="ai-deep-block">
+    <div class="ai-deep-header">
+      <span class="ai-deep-label">AI Safety Analysis (Deep)</span>
+      <span class="ai-deep-tag">Claude</span>
+    </div>
+    <div class="ai-deep-section">
+      <div class="ai-deep-heading">Vulnerability Summary</div>
+      <p>${{escHtml(d.summary || '')}}</p>
+    </div>
+    <div class="ai-deep-section">
+      <div class="ai-deep-heading">Affected Code Paths</div>
+      <ul>${{list(d.affected)}}</ul>
+    </div>
+    <div class="ai-deep-section">
+      <div class="ai-deep-heading">Migration Risks</div>
+      <ul>${{list(d.risks)}}</ul>
+    </div>
+    <div class="ai-deep-section">
+      <div class="ai-deep-heading">What to Test</div>
+      <ul>${{list(d.testing)}}</ul>
+    </div>
+    <div class="ai-deep-section">
+      <div class="ai-deep-heading">Upgrade Flow</div>
+      <ol>${{list(d.flow)}}</ol>
+    </div>
+  </div>`;
+}}
+
 // ── FILTERING ────────────────────────────────────────────────
-// Multi-dimensional filter: severity + type + bump + ecosystem + status + scope + free-text search.
+// Multi-dimensional filter: severity + type + bump + ecosystem + status + scope + risk grade + free-text.
 // All filters are AND-combined (each narrows the result set further).
 // Free-text searches pkg name, functionName, and summary (case-insensitive substring).
 function getFiltered() {{
@@ -1128,6 +1293,7 @@ function getFiltered() {{
   const eco    = document.getElementById('filter-eco').value;
   const status = document.getElementById('filter-status').value;
   const scope  = document.getElementById('filter-scope').value;
+  const risk   = document.getElementById('filter-risk').value;
   const q      = document.getElementById('search-input').value.toLowerCase().trim();
 
   return RAW.filter(r => {{
@@ -1137,6 +1303,7 @@ function getFiltered() {{
     if (eco    && r.eco               !== eco)    return false;
     if (scope  && r.scope             !== scope)  return false;
     if (status && getStatus(r)        !== status) return false;
+    if (risk   && r.aiGrade           !== risk)   return false;
     if (q) {{
       const haystack = [r.pkg, r.functionName, r.summary].join(' ').toLowerCase();
       if (!haystack.includes(q)) return false;
@@ -1196,6 +1363,7 @@ function renderTable() {{
 
     const ecoTag  = r.eco ? `<span class="eco-badge ${{r.eco}}">${{escHtml(r.eco)}}</span>` : '';
     const fnTag   = r.functionName ? `<span style="font-size:10px;color:var(--text-muted);display:block;margin-top:2px">${{escHtml(r.functionName)}}</span>` : '';
+    const riskBadge = `<span class="ai-score-badge ${{r.aiGrade}}" title="${{gradeLabel(r.aiGrade)}}: ${{r.aiScore}}/10">${{r.aiScore}}</span>`;
 
     rows.push(`<tr class="data-row${{doneClass}}${{expClass}}" data-id="${{r.alertId}}">
       <td class="td-id"><a href="${{alertUrl(r.alertId)}}" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="Open on GitHub">${{r.alertId}}${{LINK_ICON}}</a></td>
@@ -1205,7 +1373,7 @@ function renderTable() {{
       <td><span class="bump-badge ${{r.bumpType}}">${{r.bumpType}}</span></td>
       <td><span class="type-badge ${{r.depType === 'direct' ? 'direct' : 'sub'}}">${{r.depType === 'direct' ? 'direct' : 'sub-dep'}}</span></td>
       <td style="font-size:11px;color:var(--text-muted)">${{r.scope}}</td>
-      <td style="font-size:12px;color:var(--text-secondary);max-width:180px;">${{escHtml(r.action)}}</td>
+      <td>${{riskBadge}}</td>
       <td><span class="status-badge ${{isDone ? 'done' : 'todo'}}" onclick="event.stopPropagation();toggleStatus('${{r.alertId}}')" title="Click to toggle">
         ${{isDone ? '&#10003; Done' : '&bull; To Do'}}
       </span></td>
@@ -1219,6 +1387,16 @@ function renderTable() {{
       const fnField = r.functionName
         ? `<div class="detail-field"><label>Function</label><p><code>${{escHtml(r.functionName)}}</code></p></div>`
         : '';
+
+      const authorField = r.lastAuthor
+        ? `<div class="detail-field"><label>Last Committer</label><p><code>${{escHtml(r.lastAuthor)}}</code><span style="font-size:10px;color:var(--text-muted);margin-left:6px">(git blame)</span></p></div>`
+        : '';
+
+      // Split aiReason into sentences for readability
+      const reasonParas = (r.aiReason || '').split(/(?<=\.) (?=[A-Z])/).map(s => `<p>${{escHtml(s)}}</p>`).join('');
+
+      // Deep analysis (populated by run_deep_analysis.py cache)
+      const deepBlock = r.aiDeepAnalysis ? renderDeepAnalysis(r.aiDeepAnalysis) : '';
 
       rows.push(`<tr class="detail-row" data-detail="${{r.alertId}}">
         <td colspan="9">
@@ -1241,10 +1419,17 @@ function renderTable() {{
             <div class="detail-field"><label>Scope</label><p>${{r.scope}}</p></div>
             <div class="detail-field"><label>Manifest</label><p><code>${{escHtml(r.manifest)}}</code></p></div>
             <div class="detail-field"><label>Priority</label><p>${{r.priority}}</p></div>
-            <div class="detail-field"><label>Recommended Action</label>
-              <p><span class="action-chip ${{r.action === 'FIX NOW' ? 'urgent' : ''}}">${{escHtml(r.action)}}</span></p>
-            </div>
+            ${{authorField}}
             <div class="detail-field"><label>Changelog</label><p>${{changelogLink}}</p></div>
+            <div class="ai-detail-block">
+              <div class="ai-detail-header">
+                <div class="ai-detail-label">Claude Analysis</div>
+                <div class="ai-score-num ${{r.aiGrade}}">${{r.aiScore}}<span style="font-size:12px;font-weight:400;color:var(--text-muted)">/10</span></div>
+                <span class="ai-grade-chip-sm ${{r.aiGrade}}">${{gradeLabel(r.aiGrade)}}</span>
+              </div>
+              <div class="ai-detail-reason">${{reasonParas}}</div>
+            </div>
+            ${{deepBlock}}
           </div>
         </td>
       </tr>`);
@@ -1293,17 +1478,21 @@ document.querySelectorAll('thead th[data-col]').forEach(th => {{
 }});
 
 // ── FILTER LISTENERS ─────────────────────────────────────────
-['filter-severity','filter-type','filter-bump','filter-eco','filter-status','filter-scope','search-input'].forEach(id => {{
-  document.getElementById(id).addEventListener('input', () => {{ expandedRows.clear(); renderTable(); }});
+['filter-severity','filter-type','filter-bump','filter-eco','filter-status','filter-scope','filter-risk','search-input'].forEach(id => {{
+  document.getElementById(id).addEventListener('input', () => {{ expandedRows.clear(); renderTable(); updateLiveAnalysis(); }});
 }});
 document.getElementById('btn-clear').addEventListener('click', () => {{
-  ['filter-severity','filter-type','filter-bump','filter-eco','filter-status','filter-scope'].forEach(id => {{
+  ['filter-severity','filter-type','filter-bump','filter-eco','filter-status','filter-scope','filter-risk'].forEach(id => {{
     document.getElementById(id).value = '';
   }});
   document.getElementById('search-input').value = '';
   expandedRows.clear();
   renderTable();
+  updateLiveAnalysis();
 }});
+
+// ── LIVE ANALYSIS (no-op — top panel removed) ────────────────
+function updateLiveAnalysis() {{ /* top-panel removed; per-alert badges update via renderTable */ }}
 
 // ── BAR CHART ────────────────────────────────────────────────
 function renderBarChart() {{
@@ -1486,13 +1675,29 @@ def main() -> None:
 
     alerts      = fetch_alerts(repo)
     direct_deps = load_direct_deps(cfg)
-    rows        = classify(alerts, direct_deps)
-    stats       = compute_stats(rows)
-    generated   = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    rows        = classify(alerts, direct_deps, cfg)
+    enrich_alert_scores(rows)
 
+    # Attach deep analysis from cache (populated by run_deep_analysis.py)
+    deep_cache_path = _PROJECT_ROOT / "vulnerability-tracker" / ".deep-analysis-cache.json"
+    deep_cache = load_deep_cache(str(deep_cache_path))
+    deep_hit = 0
+    for r in rows:
+        entry = deep_cache.get(r["alertId"])
+        if entry and entry.get("patched") == r.get("patched"):
+            r["aiDeepAnalysis"] = entry.get("analysis")
+            deep_hit += 1
+
+    stats     = compute_stats(rows)
+    generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    safe_count = sum(1 for r in rows if r.get("aiGrade") == "good")
+    block_count = sum(1 for r in rows if r.get("aiGrade") == "danger")
     print(f"  Stats: {stats['critical']} CRITICAL / {stats['high']} HIGH / {stats['medium']} MEDIUM / {stats['low']} LOW")
     print(f"  Deps:  {stats['direct']} direct / {stats['sub']} sub-deps")
     print(f"  Bumps: {stats['patch']} patch / {stats['minor']} minor / {stats['major']} major")
+    print(f"  Safety: {safe_count} safe-to-merge / {block_count} block-first")
+    print(f"  Deep analysis: {deep_hit} alerts enriched from cache")
 
     output.parent.mkdir(parents=True, exist_ok=True)
     html = build_html(repo, label, rows, stats, generated)
