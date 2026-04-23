@@ -96,6 +96,38 @@ def fetch_alerts(repo: str) -> list[dict]:
 
 
 # ─────────────────────────────────────────────────────────────
+# ALERT SNAPSHOT (for run-over-run diff)
+# ─────────────────────────────────────────────────────────────
+
+def load_snapshot(path: Path) -> dict:
+    """Read prior alert snapshot. Returns {} if missing/corrupt."""
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_snapshot(path: Path, rows: list[dict]) -> None:
+    """Write lean snapshot (id + minimal meta) for next-run diff."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "generatedAt": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        "alerts": [
+            {
+                "alertId":  r["alertId"],
+                "pkg":      r.get("pkg", ""),
+                "severity": r.get("severity", ""),
+                "summary":  r.get("summary", ""),
+            }
+            for r in rows
+        ],
+    }
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+# ─────────────────────────────────────────────────────────────
 # DIRECT DEPS LOADING
 # ─────────────────────────────────────────────────────────────
 
@@ -443,8 +475,21 @@ def rows_to_js(rows: list[dict]) -> str:
 # HTML TEMPLATE
 # ─────────────────────────────────────────────────────────────
 
-def build_html(repo: str, label: str, rows: list[dict], stats: dict, generated_at: str) -> str:
+def build_html(
+    repo: str,
+    label: str,
+    rows: list[dict],
+    stats: dict,
+    generated_at: str,
+    resolved_since: list[dict] | None = None,
+    prior_generated: str = "",
+) -> str:
     js_data = rows_to_js(rows)
+    resolved_since = resolved_since or []
+    resolved_json = json.dumps(resolved_since, ensure_ascii=False)
+    prior_generated_js = json.dumps(prior_generated)
+    is_lambda_repo = "lambda" in repo.lower()
+    is_lambda_repo_js = "true" if is_lambda_repo else "false"
     runtime_pct = round(stats["runtime"] / stats["total"] * 100, 1) if stats["total"] else 0
     dev_pct     = round(stats["dev"]     / stats["total"] * 100, 1) if stats["total"] else 0
 
@@ -919,6 +964,36 @@ def build_html(repo: str, label: str, rows: list[dict], stats: dict, generated_a
 
 <div class="container">
 
+  <!-- RECENTLY RESOLVED BANNER (populated by JS if resolved_since has entries) -->
+  <div id="resolved-banner" style="display:none;margin-bottom:24px;padding:14px 18px;background:var(--green-bg);border:1px solid var(--green-border);border-radius:var(--radius-md);">
+    <div style="display:flex;align-items:center;gap:10px;cursor:pointer" id="resolved-banner-header">
+      <span style="color:var(--green);font-size:18px">&#10003;</span>
+      <strong style="color:var(--green)"><span id="resolved-count">0</span> alerts resolved since last run</strong>
+      <span style="color:var(--text-muted);font-size:12px" id="resolved-prior-ts"></span>
+      <span style="margin-left:auto;color:var(--text-muted);font-size:11px" id="resolved-chevron">&#9660; show list</span>
+    </div>
+    <div id="resolved-list" style="display:none;margin-top:12px;padding-top:12px;border-top:1px solid var(--green-border);max-height:200px;overflow-y:auto"></div>
+  </div>
+
+  <!-- LOCAL TESTING MODAL -->
+  <div id="lt-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;align-items:center;justify-content:center">
+    <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius-lg);padding:24px;max-width:700px;width:90%;max-height:80vh;overflow:auto">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+        <h3 style="color:var(--text-primary)">Local Testing &mdash; <span id="lt-fn" style="color:var(--blue);font-family:monospace"></span></h3>
+        <button onclick="ltClose()" style="background:none;border:none;color:var(--text-secondary);font-size:20px;cursor:pointer">&times;</button>
+      </div>
+      <div style="margin-bottom:12px">
+        <label style="display:block;color:var(--text-secondary);font-size:12px;margin-bottom:6px">Test Event</label>
+        <select id="lt-event" style="width:100%;padding:8px;background:var(--bg-primary);color:var(--text-primary);border:1px solid var(--border);border-radius:var(--radius-sm)"></select>
+      </div>
+      <div style="display:flex;gap:8px;margin-bottom:16px">
+        <button id="lt-deploy-btn" onclick="ltDeploy()" style="flex:1;padding:10px;background:var(--blue);color:white;border:none;border-radius:var(--radius-sm);cursor:pointer;font-weight:600">1. Build &amp; Deploy</button>
+        <button id="lt-invoke-btn" onclick="ltInvoke()" disabled style="flex:1;padding:10px;background:var(--green);color:white;border:none;border-radius:var(--radius-sm);cursor:pointer;font-weight:600;opacity:.5">2. Invoke</button>
+      </div>
+      <div id="lt-status" style="padding:10px;background:var(--bg-primary);border:1px solid var(--border);border-radius:var(--radius-sm);font-family:monospace;font-size:12px;color:var(--text-secondary);min-height:80px;max-height:300px;overflow:auto;white-space:pre-wrap">Ready.</div>
+    </div>
+  </div>
+
   <!-- SEVERITY CARDS -->
   <div class="section-label">Severity Overview</div>
   <div class="cards-grid">
@@ -1217,6 +1292,11 @@ def build_html(repo: str, label: str, rows: list[dict], stats: dict, generated_a
 <script>
 const REPO = '{repo}';
 const RAW  = {js_data};
+const RESOLVED_SINCE = {resolved_json};
+const PRIOR_GENERATED = {prior_generated_js};
+const IS_LAMBDA_REPO = {is_lambda_repo_js};
+const STORAGE_KEY = `dvt-status-overrides:${{REPO}}`;
+const WIZARD_BASE = window.location.origin;
 
 const TOTAL_DIRECT = {stats['direct']};
 const TOTAL_SUB    = {stats['sub']};
@@ -1224,8 +1304,34 @@ const TOTAL_SUB    = {stats['sub']};
 let sortCol = 'priority';
 let sortAsc = true;
 let expandedRows = new Set();
-let statusOverrides = {{}};
+let statusOverrides = loadStatusOverrides();
 let openStates = {{}};
+
+function loadStatusOverrides() {{
+  try {{
+    const raw = localStorage.getItem(STORAGE_KEY);
+    return raw ? JSON.parse(raw) : {{}};
+  }} catch (e) {{ return {{}}; }}
+}}
+
+function saveStatusOverrides() {{
+  try {{ localStorage.setItem(STORAGE_KEY, JSON.stringify(statusOverrides)); }} catch (e) {{}}
+}}
+
+// Auto-mark alerts resolved since last run as Done (persisted).
+// This only marks IDs that previously existed and no longer do — it does NOT
+// un-mark anything, so manual overrides are preserved.
+(function autoMarkResolved() {{
+  if (!RESOLVED_SINCE.length) return;
+  let changed = false;
+  RESOLVED_SINCE.forEach(r => {{
+    if (statusOverrides[r.alertId] !== 'Done') {{
+      statusOverrides[r.alertId] = 'Done';
+      changed = true;
+    }}
+  }});
+  if (changed) saveStatusOverrides();
+}})();
 
 function getStatus(row) {{
   return statusOverrides[row.alertId] !== undefined ? statusOverrides[row.alertId] : row.status;
@@ -1384,8 +1490,12 @@ function renderTable() {{
         ? `<a href="${{escHtml(r.changelogUrl)}}" target="_blank" rel="noopener" class="changelog-link">View changelog ${{LINK_ICON}}</a>`
         : '<span style="color:var(--text-muted)">N/A</span>';
 
+      const lambdaName = r.functionName ? 'local-' + r.functionName.replace(/_/g, '-') : '';
+      const testBtn = (IS_LAMBDA_REPO && r.functionName)
+        ? `<button onclick="event.stopPropagation();ltOpen('${{lambdaName}}')" style="margin-left:8px;padding:3px 10px;background:var(--blue);color:white;border:none;border-radius:var(--radius-sm);cursor:pointer;font-size:11px;font-weight:600">&#129514; Test in Floci</button>`
+        : '';
       const fnField = r.functionName
-        ? `<div class="detail-field"><label>Function</label><p><code>${{escHtml(r.functionName)}}</code></p></div>`
+        ? `<div class="detail-field"><label>Function</label><p><code>${{escHtml(r.functionName)}}</code>${{testBtn}}</p></div>`
         : '';
 
       const authorField = r.lastAuthor
@@ -1452,9 +1562,165 @@ function toggleStatus(alertId) {{
     ? statusOverrides[alertId]
     : RAW.find(r => r.alertId === alertId).status;
   statusOverrides[alertId] = current === 'Done' ? 'To Do' : 'Done';
+  saveStatusOverrides();
   updateProgressCards();
   renderTable();
   renderAccordion();
+}}
+
+// ── RESOLVED BANNER ─────────────────────────────────────────
+function renderResolvedBanner() {{
+  if (!RESOLVED_SINCE.length) return;
+  const banner = document.getElementById('resolved-banner');
+  banner.style.display = 'block';
+  document.getElementById('resolved-count').textContent = RESOLVED_SINCE.length;
+  document.getElementById('resolved-prior-ts').textContent =
+    PRIOR_GENERATED ? `(vs snapshot from ${{PRIOR_GENERATED}})` : '';
+
+  const list = document.getElementById('resolved-list');
+  list.innerHTML = RESOLVED_SINCE.map(r => `
+    <div style="display:flex;gap:10px;align-items:center;padding:6px 0;border-bottom:1px solid var(--green-border);font-size:12px">
+      <a href="${{alertUrl(r.alertId)}}" target="_blank" rel="noopener" style="color:var(--blue);font-family:monospace;text-decoration:none;min-width:60px">${{escHtml(r.alertId)}}</a>
+      <span style="min-width:70px;color:var(--text-muted)">${{escHtml(r.severity)}}</span>
+      <code style="color:var(--text-primary);min-width:120px">${{escHtml(r.pkg)}}</code>
+      <span style="color:var(--text-secondary);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${{escHtml(r.summary)}}</span>
+    </div>
+  `).join('');
+
+  document.getElementById('resolved-banner-header').addEventListener('click', () => {{
+    const l = document.getElementById('resolved-list');
+    const c = document.getElementById('resolved-chevron');
+    const open = l.style.display !== 'none';
+    l.style.display = open ? 'none' : 'block';
+    c.innerHTML = open ? '&#9660; show list' : '&#9650; hide list';
+  }});
+}}
+
+// ── LOCAL TESTING ───────────────────────────────────────────
+let ltCurrentFn = null;
+let ltEvents = [];
+
+async function ltOpen(functionName) {{
+  if (!functionName) return;
+  ltCurrentFn = functionName;
+  document.getElementById('lt-fn').textContent = functionName;
+  document.getElementById('lt-status').textContent = 'Loading test events...';
+  document.getElementById('lt-invoke-btn').disabled = true;
+  document.getElementById('lt-invoke-btn').style.opacity = '.5';
+  document.getElementById('lt-modal').style.display = 'flex';
+
+  try {{
+    const res = await fetch(`${{WIZARD_BASE}}/api/lambda/events`);
+    const data = await res.json();
+    ltEvents = data.events || [];
+    const sel = document.getElementById('lt-event');
+    sel.innerHTML = ltEvents.map(e => `<option value="${{escHtml(e)}}">${{escHtml(e)}}</option>`).join('');
+    const preferred = ltEvents.find(e => e.toLowerCase().includes(functionName.toLowerCase().replace(/^local-/, '').split('-')[0]));
+    if (preferred) sel.value = preferred;
+    document.getElementById('lt-status').textContent = `Ready. ${{ltEvents.length}} event file(s) available.\\nClick "Build & Deploy" to start.`;
+  }} catch (e) {{
+    document.getElementById('lt-status').textContent = `ERROR loading events: ${{e.message}}\\n\\nIs wizard_server running? Start with: make wizard-server`;
+  }}
+}}
+
+function ltClose() {{
+  document.getElementById('lt-modal').style.display = 'none';
+  ltCurrentFn = null;
+}}
+
+function ltAppend(msg) {{
+  const s = document.getElementById('lt-status');
+  s.textContent += '\\n' + msg;
+  s.scrollTop = s.scrollHeight;
+}}
+
+async function ltPollJob(jobId) {{
+  const spinner = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
+  const statusEl = document.getElementById('lt-status');
+  // Append live-status line; we'll rewrite the last line every tick.
+  statusEl.textContent += '\\n⏱ 0s  polling...';
+  statusEl.scrollTop = statusEl.scrollHeight;
+  const start = Date.now();
+  for (let i = 0; i < 300; i++) {{
+    await new Promise(r => setTimeout(r, 1000));
+    const res = await fetch(`${{WIZARD_BASE}}/api/lambda/job/${{jobId}}`);
+    const data = await res.json();
+    const elapsed = Math.round((Date.now() - start) / 1000);
+    const lastLog = (data.logs && data.logs.length) ? data.logs[data.logs.length - 1] : '';
+    const tail = lastLog ? ` — ${{lastLog.slice(0, 80)}}` : '';
+    // Rewrite last line of status with live timer
+    const lines = statusEl.textContent.split('\\n');
+    lines[lines.length - 1] = `${{spinner[i % spinner.length]}} ${{elapsed}}s  status=${{data.status}}${{tail}}`;
+    statusEl.textContent = lines.join('\\n');
+    statusEl.scrollTop = statusEl.scrollHeight;
+    if (data.status === 'done' || data.status === 'error') return data;
+  }}
+  throw new Error('Timeout waiting for job (5 min)');
+}}
+
+function ltLambdaNameToDirName(lambdaName) {{
+  // local-forms-response-sync-service → forms_response_sync_service
+  return lambdaName
+    .replace(/^local-/, '')  // strip 'local-' prefix
+    .replace(/-/g, '_');      // hyphens → underscores
+}}
+
+async function ltDeploy() {{
+  if (!ltCurrentFn) return;
+  const repoName = IS_LAMBDA_REPO ? 'beaconstac_lambda_functions' : null;
+  if (!repoName) {{ ltAppend('Local Testing only supported for Lambda repo.'); return; }}
+  const dirName = ltLambdaNameToDirName(ltCurrentFn);
+  document.getElementById('lt-deploy-btn').disabled = true;
+  ltAppend(`[deploy] POST /api/lambda/deploy  repo=${{repoName}}  function=${{dirName}}`);
+  try {{
+    const res = await fetch(`${{WIZARD_BASE}}/api/lambda/deploy`, {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ repo: repoName, function: dirName }})
+    }});
+    const data = await res.json();
+    if (!data.job_id) {{ ltAppend(`[deploy] ERROR: ${{JSON.stringify(data)}}`); document.getElementById('lt-deploy-btn').disabled = false; return; }}
+    ltAppend(`[deploy] job_id=${{data.job_id}}  polling...`);
+    const job = await ltPollJob(data.job_id);
+    const logTail = (job.logs || []).slice(-20).join('\\n');
+    ltAppend(`[deploy] ${{job.status}}\\n${{logTail}}`);
+    if (job.status === 'done') {{
+      document.getElementById('lt-invoke-btn').disabled = false;
+      document.getElementById('lt-invoke-btn').style.opacity = '1';
+    }}
+  }} catch (e) {{
+    ltAppend(`[deploy] EXCEPTION: ${{e.message}}`);
+  }} finally {{
+    document.getElementById('lt-deploy-btn').disabled = false;
+  }}
+}}
+
+async function ltInvoke() {{
+  if (!ltCurrentFn) return;
+  const repoName = 'beaconstac_lambda_functions';
+  const dirName = ltLambdaNameToDirName(ltCurrentFn);
+  const event = document.getElementById('lt-event').value;
+  document.getElementById('lt-invoke-btn').disabled = true;
+  ltAppend(`[invoke] POST /api/lambda/invoke  event=${{event}}`);
+  try {{
+    const res = await fetch(`${{WIZARD_BASE}}/api/lambda/invoke`, {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ repo: repoName, function: dirName, event: event }})
+    }});
+    const data = await res.json();
+    if (!data.job_id) {{ ltAppend(`[invoke] ERROR: ${{JSON.stringify(data)}}`); document.getElementById('lt-invoke-btn').disabled = false; return; }}
+    ltAppend(`[invoke] job_id=${{data.job_id}}  polling...`);
+    const job = await ltPollJob(data.job_id);
+    ltAppend(`[invoke] ${{job.status}}`);
+    if (job.result) ltAppend(`result:\\n${{JSON.stringify(job.result, null, 2)}}`);
+    const logTail = (job.logs || []).slice(-30).join('\\n');
+    if (logTail) ltAppend(`logs:\\n${{logTail}}`);
+  }} catch (e) {{
+    ltAppend(`[invoke] EXCEPTION: ${{e.message}}`);
+  }} finally {{
+    document.getElementById('lt-invoke-btn').disabled = false;
+  }}
 }}
 
 // ── SORT ─────────────────────────────────────────────────────
@@ -1625,6 +1891,7 @@ function updateProgressCards() {{
 }}
 
 // ── INIT ─────────────────────────────────────────────────────
+renderResolvedBanner();
 renderBarChart();
 renderDonut();
 renderTable();
@@ -1678,6 +1945,25 @@ def main() -> None:
     rows        = classify(alerts, direct_deps, cfg)
     enrich_alert_scores(rows)
 
+    # Snapshot diff: detect alerts resolved since last run
+    snapshot_path = _PROJECT_ROOT / "vulnerability-dashboards" / f".alert-snapshot-{repo.replace('/', '_')}.json"
+    prior = load_snapshot(snapshot_path)
+    current_ids = {r["alertId"] for r in rows}
+    resolved_since = []
+    if prior.get("alerts"):
+        prior_alerts = {a["alertId"]: a for a in prior["alerts"]}
+        for aid, meta in prior_alerts.items():
+            if aid not in current_ids:
+                resolved_since.append({
+                    "alertId":  aid,
+                    "pkg":      meta.get("pkg", ""),
+                    "severity": meta.get("severity", ""),
+                    "summary":  meta.get("summary", ""),
+                })
+    prior_generated = prior.get("generatedAt", "")
+    print(f"  Resolved since last run ({prior_generated or 'no prior snapshot'}): {len(resolved_since)}")
+    save_snapshot(snapshot_path, rows)
+
     # Attach deep analysis from cache (populated by run_deep_analysis.py)
     deep_cache_path = _PROJECT_ROOT / "vulnerability-dashboards" / ".deep-analysis-cache.json"
     deep_cache = load_deep_cache(str(deep_cache_path))
@@ -1700,7 +1986,7 @@ def main() -> None:
     print(f"  Deep analysis: {deep_hit} alerts enriched from cache")
 
     output.parent.mkdir(parents=True, exist_ok=True)
-    html = build_html(repo, label, rows, stats, generated)
+    html = build_html(repo, label, rows, stats, generated, resolved_since, prior_generated)
     output.write_text(html, encoding="utf-8")
 
     print(f"\n  Dashboard written → {output}")
