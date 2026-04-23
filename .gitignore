@@ -1,4 +1,24 @@
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
+
+# OS
 .DS_Store
-vulnerability-tracker/.deep-analysis-cache.json
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+
+# Env files
+.env
+.env.local
+
+# Cache + artefacts
+vulnerability-dashboards/.deep-analysis-cache.json
+.localtest_out/
+.localtest_pkg/
+function.zip
+localstack-data/

@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-generate-dashboard.py
+generate_dashboard.py
 Fetches live Dependabot alerts from a GitHub repo, classifies them,
 enriches with bump-type / changelog URL / function name, and writes
 a self-contained HTML dashboard.
 
 Usage:
-  python3 scripts/generate-dashboard.py                                  # angular (default)
-  python3 scripts/generate-dashboard.py mobstac-private/beaconstac_lambda_functions
-  python3 scripts/generate-dashboard.py --repo mobstac-private/beaconstac_lambda_functions
+  python3 scripts/generate_dashboard.py                                  # angular (default)
+  python3 scripts/generate_dashboard.py mobstac-private/beaconstac_lambda_functions
+  python3 scripts/generate_dashboard.py --repo mobstac-private/beaconstac_lambda_functions
 
 Requires: gh CLI authenticated with repo scope.
 """
@@ -39,13 +39,13 @@ REPO_CONFIGS: dict[str, dict] = {
         "local_path":  "/Users/harshitky/Desktop/Work/beaconstac_angular_portal",
         "deps_mode":   "angular",
         "package_dir": "bac-app",
-        "output":      _PROJECT_ROOT / "vulnerability-tracker" / "dashboard.html",
+        "output":      _PROJECT_ROOT / "vulnerability-dashboards" / "angular-dashboard.html",
     },
     "mobstac-private/beaconstac_lambda_functions": {
         "label":       "Lambda Functions",
         "local_path":  "/Users/harshitky/Desktop/Work/beaconstac_lambda_functions",
         "deps_mode":   "lambda_monorepo",
-        "output":      _PROJECT_ROOT / "vulnerability-tracker" / "lambda-dashboard.html",
+        "output":      _PROJECT_ROOT / "vulnerability-dashboards" / "lambda-dashboard.html",
     },
 }
 
@@ -1234,7 +1234,7 @@ function getStatus(row) {{
 // ── SCORE CONFIG ─────────────────────────────────────────────
 // Merge-safety score: 0–10. Higher = safer to merge first.
 // good(8-10) = green = low risk; danger(0-2) = red = block.
-// Scores pre-computed by Python _SCORE_WEIGHTS in generate-dashboard.py.
+// Scores pre-computed by Python _SCORE_WEIGHTS in generate_dashboard.py.
 // To adjust: edit _SCORE_WEIGHTS there and re-run.
 const SCORE_CONFIG = {{
   grades: {{
@@ -1662,7 +1662,7 @@ def main() -> None:
             "label":      repo.split("/")[-1],
             "local_path": "",
             "deps_mode":  "unknown",
-            "output":     _PROJECT_ROOT / "vulnerability-tracker" / "dashboard.html",
+            "output":     _PROJECT_ROOT / "vulnerability-dashboards" / "angular-dashboard.html",
         }
 
     label  = cfg["label"]
@@ -1679,7 +1679,7 @@ def main() -> None:
     enrich_alert_scores(rows)
 
     # Attach deep analysis from cache (populated by run_deep_analysis.py)
-    deep_cache_path = _PROJECT_ROOT / "vulnerability-tracker" / ".deep-analysis-cache.json"
+    deep_cache_path = _PROJECT_ROOT / "vulnerability-dashboards" / ".deep-analysis-cache.json"
     deep_cache = load_deep_cache(str(deep_cache_path))
     deep_hit = 0
     for r in rows:

@@ -1,1 +1,0 @@
-{"errorType":"CredentialsError","errorMessage":"Missing credentials in config, if using AWS_CONFIG_FILE, set AWS_SDK_LOAD_CONFIG=1","trace":["Error: connect ECONNREFUSED 169.254.169.254:80","    at TCPConnectWrap.afterConnect [as oncomplete] (node:net:1555:16)"]}

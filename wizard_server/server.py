@@ -1,11 +1,29 @@
-"""HTTP server — stdlib-only, serves dashboard + API routes."""
+"""HTTP server — stdlib-only, serves dashboards + REST API.
+
+Routes:
+  GET  /                        → Angular dashboard
+  GET  /api/config              → repo + server config
+  GET  /api/health              → liveness check
+  GET  /api/status/<job_id>     → pipeline job status
+  POST /api/analyze             → analyse a package upgrade
+  POST /api/test-upgrade        → run upgrade pipeline (async)
+  POST /api/cancel/<job_id>     → cancel running pipeline
+  POST /api/config/repos        → register a new repo
+
+  Lambda local-testing API (see wizard_server/lambda_tester.py):
+  GET  /api/lambda/emulator/status
+  POST /api/lambda/emulator/{start,stop}
+  GET  /api/lambda/list
+  GET  /api/lambda/events
+  POST /api/lambda/{deploy,invoke}
+  GET  /api/lambda/job/<job_id>
+"""
 
 import json
-import os
 import socketserver
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse
 
 from . import config_schema, repos, jobs as jobs_mod, lambda_tester
 
@@ -119,10 +137,10 @@ class WizardHandler(SimpleHTTPRequestHandler):
     # ── Dashboard ────────────────────────────────────────────
 
     def _serve_dashboard(self):
-        dashboard = _project_root / "vulnerability-tracker" / "dashboard.html"
+        dashboard = _project_root / "vulnerability-dashboards" / "angular-dashboard.html"
         if not dashboard.exists():
             self._json_response(404, {
-                "error": "Dashboard not found. Run: ./scripts/refresh-dashboard.sh"
+                "error": "Dashboard not found. Run: ./scripts/refresh-angular-dashboard.sh"
             })
             return
         self.send_response(200)

@@ -1,7 +1,12 @@
-"""Repo manager — auto-detection of repo type, Lambda function scanning, command resolution."""
+"""Repo introspection — type detection, Lambda function scanning, command resolution.
+
+Called on server startup to enrich each entry in config/wizard-config.json with:
+  - detected type (angular, lambda_monorepo, ...)
+  - scanned function metadata (runtime, tests, triggers, services)
+  - default test commands
+"""
 
 import json
-import os
 import re
 from pathlib import Path
 

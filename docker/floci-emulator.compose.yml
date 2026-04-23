@@ -25,7 +25,10 @@ services:
       # attach the sub-containers to so they can hit the Runtime endpoint.
       # FLOCI_HOSTNAME tells spawned containers to resolve "floci" instead
       # of a container IP that may not route.
-      - FLOCI_SERVICES_LAMBDA_DOCKER_NETWORK=localtestingforlambda_default
+      # Network name is derived by Docker Compose from the parent directory:
+      # lowercased + non-alphanumerics stripped + "_default" suffix.
+      # If you rename the repo dir, regenerate with: docker network ls | grep default
+      - FLOCI_SERVICES_LAMBDA_DOCKER_NETWORK=dependabotvulnerabilitytracker_default
       - FLOCI_HOSTNAME=floci
     networks:
       default:

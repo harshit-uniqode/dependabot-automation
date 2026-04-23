@@ -42,7 +42,7 @@ Read `bac-app/package.json` and collect all package names from these four fields
 
 This gives the **authoritative set** of packages the team explicitly manages.
 
-Script location: `scripts/generate-dashboard.py`, function `load_direct_deps()`.
+Script location: `scripts/generate_dashboard.py`, function `load_direct_deps()`.
 
 ### Step 2 — Compare each alert's package name against the set
 
@@ -160,7 +160,7 @@ Use sparingly — it can break the parent package if the override is incompatibl
 
 ---
 
-## Data pipeline: generate-dashboard.py
+## Data pipeline: generate_dashboard.py
 
 ```
 gh api repos/{owner}/{repo}/dependabot/alerts --paginate
@@ -185,7 +185,7 @@ compute_stats() → counts per severity, dep type, scope
 build_html() → inline JS data array + full dashboard HTML
          │
          ▼
-Write: vulnerability-tracker/dashboard.html
+Write: vulnerability-dashboards/angular-dashboard.html
 ```
 
 ---
@@ -206,14 +206,14 @@ Write: vulnerability-tracker/dashboard.html
 
 ```bash
 # One command — fetches live data, regenerates HTML, opens browser
-./scripts/refresh-dashboard.sh
+./scripts/refresh-angular-dashboard.sh
 
 # Override repo (for other repos)
-./scripts/refresh-dashboard.sh owner/other-repo
+./scripts/refresh-angular-dashboard.sh owner/other-repo
 ```
 
 The script requires `gh` CLI authenticated with `repo` scope. It reads
-`package.json` from the local filesystem path configured in `generate-dashboard.py`
+`package.json` from the local filesystem path configured in `generate_dashboard.py`
 (`PACKAGE_JSON_PATH`). Update that path if the repo is cloned elsewhere.
 
 ---
@@ -222,8 +222,8 @@ The script requires `gh` CLI authenticated with `repo` scope. It reads
 
 | File | Purpose |
 |------|---------|
-| `scripts/generate-dashboard.py` | Main generator — fetches, classifies, builds HTML |
-| `scripts/refresh-dashboard.sh` | One-command wrapper — auth check + run + open browser |
-| `vulnerability-tracker/dashboard.html` | Generated output — open directly in browser |
-| `vulnerability-tracker/hit-list.csv` | Static snapshot — committed to git for record-keeping |
-| `vulnerability-tracker/risk-register.csv` | Risk-accepted items with Raghav approval |
+| `scripts/generate_dashboard.py` | Main generator — fetches, classifies, builds HTML |
+| `scripts/refresh-angular-dashboard.sh` | One-command wrapper — auth check + run + open browser |
+| `vulnerability-dashboards/angular-dashboard.html` | Generated output — open directly in browser |
+| `vulnerability-dashboards/hit-list.csv` | Static snapshot — committed to git for record-keeping |
+| `vulnerability-dashboards/risk-register.csv` | Risk-accepted items with Raghav approval |

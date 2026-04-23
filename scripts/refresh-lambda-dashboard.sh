@@ -2,8 +2,7 @@
 # refresh-lambda-dashboard.sh
 # Regenerates the Lambda Functions vulnerability dashboard.
 #
-# Usage:
-#   ./scripts/refresh-lambda-dashboard.sh
+# Usage: ./scripts/refresh-lambda-dashboard.sh
 
 set -euo pipefail
 
@@ -19,9 +18,9 @@ if ! gh auth status &>/dev/null; then
   exit 1
 fi
 
-python3 "$SCRIPT_DIR/generate-dashboard.py" mobstac-private/beaconstac_lambda_functions
+python3 "$SCRIPT_DIR/generate_dashboard.py" mobstac-private/beaconstac_lambda_functions
 
-DASHBOARD="$SCRIPT_DIR/../vulnerability-tracker/lambda-dashboard.html"
+DASHBOARD="$SCRIPT_DIR/../vulnerability-dashboards/lambda-dashboard.html"
 if [ -f "$DASHBOARD" ]; then
   echo "  Opening dashboard in browser..."
   open "$DASHBOARD"

@@ -1,25 +1,45 @@
-# Lambda Local Testing Makefile
-# Usage:
-#   make emulator-up              — start Floci emulator
-#   make emulator-up-localstack   — start LocalStack emulator (requires LOCALSTACK_AUTH_TOKEN)
-#   make emulator-down            — stop emulator
-#   make setup-resources          — create S3 buckets, SQS queues, DynamoDB tables
-#   make test-local FUNCTION=MyFunction EVENT=test-events/sqs-event.json
-#   make test-all FUNCTION=MyFunction
-#   make logs                     — tail emulator logs
-#   make health                   — check emulator health
+# Dependabot Vulnerability Tracker — Makefile
+# The dashboard (served by `make wizard-server`) is the primary UI.
+# CLI targets below are for power-users and CI.
+#
+# Quick start:
+#   make wizard-server          — start the dashboard + API on :8787
+#   make emulator-up            — start Floci AWS emulator on :4566
+#   make emulator-down          — stop the emulator
+#   make refresh-lambda         — regenerate the Lambda dashboard
+#   make refresh-angular        — regenerate the Angular dashboard
+#
+# Lambda testing (dashboard-driven flow below also exposed as CLI):
+#   make lambda-deploy DIR=<path> HANDLER=<file.fn> LANG=<node|python>
+#   make lambda-invoke NAME=<fn-name> EVENT=<path/to/event.json>
+#   make lambda-list
+#   make lambda-logs   NAME=<fn-name>
+#   make lambda-clean  NAME=<fn-name>
 
-EMULATOR_URL := http://localhost:4566
-AWS_CMD      := aws --endpoint-url=$(EMULATOR_URL) \
-                    --region us-east-1 \
-                    --no-cli-pager
-COMPOSE_FILE := docker-compose.test.yml
+EMULATOR_URL     := http://localhost:4566
+FLOCI_COMPOSE    := docker/floci-emulator.compose.yml
+LS_COMPOSE       := docker/localstack-emulator.compose.yml
+AWS_CLI_LOCAL    := aws --endpoint-url=$(EMULATOR_URL) --region us-east-1 --no-cli-pager
+AWSLOCAL         := $(shell command -v awslocal 2>/dev/null || echo "$(AWS_CLI_LOCAL)")
 
-# ── Emulator lifecycle ────────────────────────────────────────────────────────
+# ── Wizard server (dashboard + API) ──────────────────────────────────
+
+wizard-server:
+	@python3 -m wizard_server
+
+# ── Dashboard regen ─────────────────────────────────────────────────
+
+refresh-lambda:
+	@./scripts/refresh-lambda-dashboard.sh
+
+refresh-angular:
+	@./scripts/refresh-angular-dashboard.sh
+
+# ── Emulator lifecycle ──────────────────────────────────────────────
 
 emulator-up:
 	@echo "Starting Floci emulator..."
-	docker compose -f $(COMPOSE_FILE) up -d
+	docker compose -f $(FLOCI_COMPOSE) up -d
 	@echo "Waiting for emulator to be healthy..."
 	@until curl -sf $(EMULATOR_URL)/_floci/health > /dev/null 2>&1 || \
 	       curl -sf $(EMULATOR_URL)/_localstack/health > /dev/null 2>&1; do \
@@ -29,10 +49,9 @@ emulator-up:
 	$(MAKE) setup-resources
 
 emulator-up-localstack:
-	@echo "Starting LocalStack emulator (requires LOCALSTACK_AUTH_TOKEN)..."
+	@echo "Starting LocalStack (requires LOCALSTACK_AUTH_TOKEN)..."
 	@[ -n "$(LOCALSTACK_AUTH_TOKEN)" ] || (echo "ERROR: Set LOCALSTACK_AUTH_TOKEN first" && exit 1)
-	docker compose -f docker-compose.localstack.yml up -d
-	@echo "Waiting for LocalStack to be healthy..."
+	docker compose -f $(LS_COMPOSE) up -d
 	@until curl -sf $(EMULATOR_URL)/_localstack/health > /dev/null 2>&1; do \
 		printf '.'; sleep 2; \
 	done
@@ -40,87 +59,39 @@ emulator-up-localstack:
 	$(MAKE) setup-resources
 
 emulator-down:
-	docker compose -f docker-compose.test.yml down 2>/dev/null || true
-	docker compose -f docker-compose.localstack.yml down 2>/dev/null || true
+	@docker compose -f $(FLOCI_COMPOSE) down 2>/dev/null || true
+	@docker compose -f $(LS_COMPOSE) down 2>/dev/null || true
 	@echo "Emulator stopped."
 
-logs:
-	docker compose -f $(COMPOSE_FILE) logs -f
+emulator-logs:
+	docker compose -f $(FLOCI_COMPOSE) logs -f
 
-health:
+emulator-health:
 	@curl -sf $(EMULATOR_URL)/_floci/health 2>/dev/null || \
 	 curl -sf $(EMULATOR_URL)/_localstack/health 2>/dev/null || \
 	 echo "Emulator not running"
 
-# ── Resource setup ────────────────────────────────────────────────────────────
+# ── Test resources (S3 buckets, SQS queues, DynamoDB tables) ────────
 
 setup-resources:
-	@echo "Creating test AWS resources..."
-	./scripts/setup-local-resources.sh
+	@./scripts/setup-emulator-aws-resources.sh
 
 teardown-resources:
-	@echo "Removing test AWS resources..."
-	./scripts/teardown.sh
+	@./scripts/teardown-emulator-aws-resources.sh
 
-# ── Lambda invocation ─────────────────────────────────────────────────────────
-
-# Invoke a single Lambda with a specific test event
-# Usage: make test-local FUNCTION=MyFunction EVENT=test-events/sqs-event.json
-test-local:
-	@[ -n "$(FUNCTION)" ] || (echo "ERROR: Specify FUNCTION=<name>" && exit 1)
-	@[ -n "$(EVENT)" ] || (echo "ERROR: Specify EVENT=<path>" && exit 1)
-	@echo "Building $(FUNCTION)..."
-	sam build --template-file $(FUNCTION)/template.yml 2>/dev/null || sam build
-	@echo "Invoking $(FUNCTION) with $(EVENT)..."
-	sam local invoke $(FUNCTION) \
-		--event $(EVENT) \
-		--env-vars env.json \
-		--docker-network host
-	@echo "\nDone. Check output above for errors."
-
-# Invoke Lambda with ALL test events in test-events/
-# Usage: make test-all FUNCTION=MyFunction
-test-all:
-	@[ -n "$(FUNCTION)" ] || (echo "ERROR: Specify FUNCTION=<name>" && exit 1)
-	@echo "Building $(FUNCTION)..."
-	sam build --template-file $(FUNCTION)/template.yml 2>/dev/null || sam build
-	@for event in test-events/*.json; do \
-		echo "\n--- Testing with $$event ---"; \
-		sam local invoke $(FUNCTION) \
-			--event $$event \
-			--env-vars env.json \
-			--docker-network host; \
-	done
-
-# Quick sanity check — list S3 buckets & SQS queues to verify resources exist
 verify-resources:
-	@echo "=== S3 Buckets ==="
-	$(AWS_CMD) s3 ls
-	@echo "\n=== SQS Queues ==="
-	$(AWS_CMD) sqs list-queues
-	@echo "\n=== DynamoDB Tables ==="
-	$(AWS_CMD) dynamodb list-tables
+	@echo "=== S3 Buckets ==="; $(AWSLOCAL) s3 ls
+	@echo "\n=== SQS Queues ==="; $(AWSLOCAL) sqs list-queues
+	@echo "\n=== DynamoDB Tables ==="; $(AWSLOCAL) dynamodb list-tables
 
-# ── Dependency analysis ───────────────────────────────────────────────────────
-
-# Find unused Node.js dependencies in a Lambda repo
-# Usage: make depcheck PATH=/path/to/lambda-repo
-depcheck:
-	@[ -n "$(PATH)" ] || (echo "ERROR: Specify PATH=/path/to/lambda-repo" && exit 1)
-	npx depcheck $(PATH)
-
-# ── Generic Lambda deploy/invoke (CLI equivalents of dashboard Local Testing) ──
+# ── Lambda deploy / invoke / list / logs ────────────────────────────
 #
-# Usage:
-#   make lambda-deploy DIR=/path/to/fn HANDLER=index.sendEmail RUNTIME=nodejs18.x LANG=node
-#   make lambda-invoke NAME=local-send-email EVENT=test-events/sqs-event.json
-#   make lambda-list
-#   make lambda-logs NAME=local-send-email
+# Deploy:
+#   make lambda-deploy DIR=/path/to/fn HANDLER=index.sendEmail LANG=node
+#   make lambda-deploy DIR=/path/to/fn HANDLER=handler.lambda_handler LANG=python
 #
-# LANG=node builds via `npm install && npm run compile` (prefers dist/).
-# LANG=python installs requirements into .localtest_pkg/ before zipping.
-
-AWSLOCAL := $(shell command -v awslocal 2>/dev/null || echo "aws --endpoint-url=$(EMULATOR_URL) --region us-east-1 --no-cli-pager")
+# Invoke:
+#   make lambda-invoke NAME=local-send-email EVENT=lambda-test-events/sqs-event.json
 
 lambda-deploy:
 	@[ -n "$(DIR)" ]     || (echo "ERROR: Specify DIR=/path/to/function-dir" && exit 1)
@@ -180,13 +151,14 @@ lambda-clean:
 	@[ -n "$(NAME)" ] || (echo "ERROR: Specify NAME=<function-name>" && exit 1)
 	$(AWSLOCAL) lambda delete-function --function-name $(NAME)
 
-# ── Wizard server (serves dashboard + local-test API) ─────────────────────────
+# ── Dependency analysis ─────────────────────────────────────────────
 
-wizard-server:
-	@python3 -m wizard_server
+depcheck:
+	@[ -n "$(DEP_PATH)" ] || (echo "ERROR: Specify DEP_PATH=/path/to/lambda-repo" && exit 1)
+	npx depcheck $(DEP_PATH)
 
-.PHONY: emulator-up emulator-up-localstack emulator-down logs health \
-        setup-resources teardown-resources test-local test-all \
-        verify-resources depcheck \
+.PHONY: wizard-server refresh-lambda refresh-angular \
+        emulator-up emulator-up-localstack emulator-down emulator-logs emulator-health \
+        setup-resources teardown-resources verify-resources \
         lambda-deploy lambda-invoke lambda-list lambda-logs lambda-clean \
-        wizard-server
+        depcheck

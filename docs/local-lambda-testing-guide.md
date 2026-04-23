@@ -133,7 +133,7 @@ Click **"Local Testing"** at the top of the dashboard.
 On first load the UI fetches:
 - List of Lambda repos from `wizard-config.json`
 - Functions per repo (parsed from each `serverless.yml`)
-- Test events from `test-events/*.json`
+- Test events from `lambda-test-events/*.json`
 - Current emulator status
 
 ### Step 2 — Start the emulator
@@ -165,7 +165,7 @@ Typical time: 15-60 seconds depending on dep size.
 
 ### Step 5 — Invoke
 
-1. Pick a **test event** from `test-events/` — e.g. `sqs-event.json`.
+1. Pick a **test event** from `lambda-test-events/` — e.g. `sqs-event.json`.
 2. Click **Invoke**.
 3. Output panel shows:
    - `StatusCode` (200 = invocation succeeded)
@@ -197,7 +197,7 @@ Docker consumes ~300-500 MB RAM while running. Always stop it when you're not us
 
 ## Test events — how they work
 
-Files in `test-events/*.json` are the payloads your Lambda receives when invoked. Each one matches an AWS trigger type:
+Files in `lambda-test-events/*.json` are the payloads your Lambda receives when invoked. Each one matches an AWS trigger type:
 
 | File | Trigger | Edit when |
 |------|---------|-----------|
@@ -219,7 +219,7 @@ Files in `test-events/*.json` are the payloads your Lambda receives when invoked
 }
 ```
 
-Wrap that in the `Records[].body` shape and save to `test-events/sqs-event.json`.
+Wrap that in the `Records[].body` shape and save to `lambda-test-events/sqs-event.json`.
 
 Add new event files whenever you work on a Lambda with a different trigger. The Local Testing tab auto-discovers them.
 
@@ -227,7 +227,7 @@ Add new event files whenever you work on a Lambda with a different trigger. The 
 
 ## Setting up AWS resources for a Lambda
 
-Some Lambdas expect S3 buckets, SQS queues, DynamoDB tables to exist. Edit `scripts/setup-local-resources.sh` to add what your function needs:
+Some Lambdas expect S3 buckets, SQS queues, DynamoDB tables to exist. Edit `scripts/setup-emulator-aws-resources.sh` to add what your function needs:
 
 ```bash
 S3_BUCKETS=( "my-test-bucket" )
@@ -259,7 +259,7 @@ Every dashboard button has a Makefile equivalent:
 | Stop emulator | `make emulator-down` |
 | Build + deploy Node Lambda | `make lambda-deploy DIR=/path/to/fn HANDLER=index.sendEmail LANG=node` |
 | Build + deploy Python Lambda | `make lambda-deploy DIR=/path/to/fn HANDLER=handler.lambda_handler LANG=python` |
-| Invoke | `make lambda-invoke NAME=local-send-email EVENT=test-events/sqs-event.json` |
+| Invoke | `make lambda-invoke NAME=local-send-email EVENT=lambda-test-events/sqs-event.json` |
 | List deployed | `make lambda-list` |
 | Tail logs | `make lambda-logs NAME=local-send-email` |
 | Delete a function | `make lambda-clean NAME=local-send-email` |
@@ -333,26 +333,25 @@ docker ps -a | grep -E "lambda|floci|localstack" | awk '{print $1}' | xargs dock
 ## What's actually in the repo
 
 ```
-Local Testing For lambda/
-├── docker-compose.test.yml               # Floci emulator definition
-├── docker-compose.localstack.yml         # LocalStack alternative
-├── Makefile                              # All CLI commands (emulator, deploy, invoke)
-├── env.json                              # SAM env overrides (legacy — SAM path)
-├── test-events/                          # JSON payloads for different triggers
-│   ├── sqs-event.json
-│   ├── s3-event.json
-│   ├── api-gateway-event.json
-│   └── dynamodb-stream-event.json
+dependabot-vulnerability-tracker/
+├── docker/
+│   ├── floci-emulator.compose.yml        # Default Floci emulator
+│   └── localstack-emulator.compose.yml   # LocalStack alternative
+├── Makefile                              # CLI entry points (emulator, deploy, invoke)
+├── config/
+│   ├── wizard-config.json                # Repo paths + server settings
+│   └── lambda-env-vars.json              # Lambda env-var overrides
+├── lambda-test-events/                   # Sample event payloads per trigger type
 ├── scripts/
-│   ├── setup-local-resources.sh          # Creates S3/SQS/DynamoDB on the emulator
-│   └── teardown.sh                       # Removes them
+│   ├── setup-emulator-aws-resources.sh   # Create S3/SQS/DynamoDB on emulator
+│   └── teardown-emulator-aws-resources.sh
 ├── wizard_server/
 │   ├── server.py                         # HTTP server (port 8787)
 │   ├── api.py                            # /api/analyze, /api/test-upgrade
 │   ├── lambda_tester.py                  # NEW — /api/lambda/* endpoints
 │   ├── repos.py                          # Lambda monorepo scanner
 │   └── ...
-├── vulnerability-tracker/
+├── vulnerability-dashboards/
 │   └── lambda-dashboard.html             # The dashboard with Vulns + Local Testing tabs
 └── docs/
     ├── testing-workflow.md               # Tier 1/2/3 testing strategy

@@ -1,6 +1,6 @@
 # Filtering Logic & Workflow
 
-How `generate-dashboard.py` and the dashboard's in-browser filter system work.
+How `generate_dashboard.py` and the dashboard's in-browser filter system work.
 
 ---
 
@@ -129,7 +129,7 @@ Clicking a row's status badge toggles it in a session-local `statusOverrides` ma
 statusOverrides[alertId] = current === 'Done' ? 'To Do' : 'Done'
 ```
 This is in-memory only — refreshing the page resets all statuses to "To Do".
-For persistent tracking, export to the `vulnerability-tracker/risk-register.csv`.
+For persistent tracking, export to the `vulnerability-dashboards/risk-register.csv`.
 
 ### Sorting
 
@@ -141,14 +141,14 @@ Default sort: `priority` ascending, then `-cvss` descending, then package name.
 
 ## Adding a New Repo
 
-1. Add an entry to `REPO_CONFIGS` in `generate-dashboard.py`:
+1. Add an entry to `REPO_CONFIGS` in `generate_dashboard.py`:
 
 ```python
 "owner/repo-name": {
     "label":      "My Repo",
     "local_path": "/path/to/local/clone",
     "deps_mode":  "lambda_monorepo",   # or "angular" or "unknown"
-    "output":     _PROJECT_ROOT / "vulnerability-tracker" / "myrepo-dashboard.html",
+    "output":     _PROJECT_ROOT / "vulnerability-dashboards" / "myrepo-dashboard.html",
 },
 ```
 
@@ -170,7 +170,7 @@ cp scripts/refresh-lambda-dashboard.sh scripts/refresh-myrepo-dashboard.sh
 
 ```
 1. [Weekly / on Dependabot alert] Run refresh script
-   ./scripts/refresh-dashboard.sh           # angular portal
+   ./scripts/refresh-angular-dashboard.sh           # angular portal
    ./scripts/refresh-lambda-dashboard.sh    # lambda functions
 
 2. [Triage] Open dashboard, filter by:
@@ -187,7 +187,7 @@ cp scripts/refresh-lambda-dashboard.sh scripts/refresh-myrepo-dashboard.sh
    ./scripts/analyze-changelog.sh npm axios 1.0.0 1.15.0
 
 5. [Track] Toggle row status to Done as fixes land.
-   Persist decisions in vulnerability-tracker/risk-register.csv.
+   Persist decisions in vulnerability-dashboards/risk-register.csv.
 ```
 
 ---
@@ -196,11 +196,11 @@ cp scripts/refresh-lambda-dashboard.sh scripts/refresh-myrepo-dashboard.sh
 
 | Path | Purpose |
 |------|---------|
-| `scripts/generate-dashboard.py` | Main generator — fetch, classify, build HTML |
-| `scripts/refresh-dashboard.sh` | Regenerate Angular Portal dashboard |
+| `scripts/generate_dashboard.py` | Main generator — fetch, classify, build HTML |
+| `scripts/refresh-angular-dashboard.sh` | Regenerate Angular Portal dashboard |
 | `scripts/refresh-lambda-dashboard.sh` | Regenerate Lambda Functions dashboard |
 | `scripts/analyze-changelog.sh` | Deep changelog analysis helper |
-| `vulnerability-tracker/dashboard.html` | Angular Portal dashboard (generated) |
-| `vulnerability-tracker/lambda-dashboard.html` | Lambda Functions dashboard (generated) |
-| `vulnerability-tracker/risk-register.csv` | Persistent tracking for audit trail |
+| `vulnerability-dashboards/angular-dashboard.html` | Angular Portal dashboard (generated) |
+| `vulnerability-dashboards/lambda-dashboard.html` | Lambda Functions dashboard (generated) |
+| `vulnerability-dashboards/risk-register.csv` | Persistent tracking for audit trail |
 | `wizard-config.json` | Wizard server config (repos + upgrade jobs) |

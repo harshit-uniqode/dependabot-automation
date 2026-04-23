@@ -3,7 +3,7 @@
 git_blame_lookup.py
 Fetch the last-committer name for a subdirectory in a local git repo.
 
-Used by generate-dashboard.py to show "who last touched this Lambda function"
+Used by generate_dashboard.py to show "who last touched this Lambda function"
 in the expanded alert detail view — a blame signal for triage.
 
 Silent fallback: returns "" on any failure (missing repo, unknown path, timeout).

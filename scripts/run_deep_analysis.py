@@ -4,24 +4,17 @@ run_deep_analysis.py
 Filtered, cached deep LLM analysis for Dependabot alerts.
 
 Pipeline:
-  fetch alerts (via generate-dashboard.fetch_alerts + classify)
-    → apply filters (severity, depType, scope)
-    → for each filtered alert:
-        skip if cached (unless --force)
-        call deep_analyze_with_llm()
-        store result keyed by alertId
-    → write cache to vulnerability-tracker/.deep-analysis-cache.json
+  fetch alerts (generate_dashboard.fetch_alerts + classify)
+    → filter (severity, depType, scope)
+    → deep_analyze_with_llm() per alert (skip cached unless --force)
+    → write cache to vulnerability-dashboards/.deep-analysis-cache.json
 
 Dashboard generation reads this cache and renders the structured analysis
 in the expanded row. This script is the ONLY place we spend LLM tokens.
 
 Usage:
-  python3 scripts/run_deep_analysis.py \\
-      --repo mobstac-private/beaconstac_lambda_functions \\
-      --severity CRITICAL,HIGH \\
-      --dep-type direct
-
-  python3 scripts/run_deep_analysis.py --repo <r> --dry-run
+  python3 scripts/run_deep_analysis.py --repo <owner/repo>
+  python3 scripts/run_deep_analysis.py --repo <r> --severity CRITICAL,HIGH --dep-type direct
   python3 scripts/run_deep_analysis.py --repo <r> --force    # ignore cache
 """
 
@@ -33,20 +26,15 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Allow sibling imports
 _SCRIPT_DIR = Path(__file__).parent
 sys.path.insert(0, str(_SCRIPT_DIR))
 
-import importlib.util
-_spec = importlib.util.spec_from_file_location("generate_dashboard", _SCRIPT_DIR / "generate-dashboard.py")
-_gd = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_gd)
-
+import generate_dashboard as _gd
 from analyze_alert import deep_analyze_with_llm, load_deep_cache, save_deep_cache
 
 
 _PROJECT_ROOT = Path(__file__).parent.parent
-_DEFAULT_CACHE = _PROJECT_ROOT / "vulnerability-tracker" / ".deep-analysis-cache.json"
+_DEFAULT_CACHE = _PROJECT_ROOT / "vulnerability-dashboards" / ".deep-analysis-cache.json"
 
 
 def _parse_args():
@@ -99,7 +87,7 @@ def main() -> None:
     print(f"  Cache:      {args.cache}")
     print(f"  Dry-run:    {args.dry_run}")
 
-    # Reuse the fetch + classify pipeline from generate-dashboard.py
+    # Reuse the fetch + classify pipeline from generate_dashboard.py
     alerts = _gd.fetch_alerts(args.repo)
     direct_deps = _gd.load_direct_deps(cfg)
     rows = _gd.classify(alerts, direct_deps)

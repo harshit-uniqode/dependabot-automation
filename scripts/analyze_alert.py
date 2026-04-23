@@ -4,7 +4,7 @@ analyze_alert.py
 Standalone merge-safety scoring and AI analysis for Dependabot alerts.
 
 Usage:
-  # As module — import into generate-dashboard.py or other scripts
+  # As module — import into generate_dashboard.py or other scripts
   from analyze_alert import score_alert, analyze_alerts_batch, enrich_alert_scores
 
   # As CLI — rescore a single alert or batch from JSON
@@ -16,7 +16,7 @@ Design:
   - Rule-based scoring is the fast default (zero API calls, deterministic)
   - LLM enrichment is opt-in: adds deeper reasoning per alert via Claude API
   - Prompt template is optimised for minimum tokens + maximum signal
-  - All scoring logic lives here — generate-dashboard.py imports it
+  - All scoring logic lives here — generate_dashboard.py imports it
 """
 
 from __future__ import annotations

@@ -1,10 +1,9 @@
-"""Configuration loading, validation, and defaults for wizard-config.json."""
+"""Load, validate, and default config/wizard-config.json."""
 
 import json
-import os
 from pathlib import Path
 
-CONFIG_PATH = Path(__file__).parent.parent / "wizard-config.json"
+CONFIG_PATH = Path(__file__).parent.parent / "config" / "wizard-config.json"
 
 DEFAULT_CONFIG = {
     "version": 1,

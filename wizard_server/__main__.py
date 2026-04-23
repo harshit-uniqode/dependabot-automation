@@ -1,33 +1,20 @@
 """Entry point: python3 -m wizard_server [--port PORT] [--host HOST]"""
 
-import sys
+import argparse
+
 from .server import start_server
 
 
 def main():
-    host = None
-    port = None
+    parser = argparse.ArgumentParser(
+        prog="python3 -m wizard_server",
+        description="Start the dependabot wizard server. Default: http://127.0.0.1:8787/",
+    )
+    parser.add_argument("--host", help="Bind host (overrides wizard-config.json)")
+    parser.add_argument("--port", type=int, help="Bind port (overrides wizard-config.json)")
+    args = parser.parse_args()
 
-    args = sys.argv[1:]
-    i = 0
-    while i < len(args):
-        if args[i] == "--port" and i + 1 < len(args):
-            port = int(args[i + 1])
-            i += 2
-        elif args[i] == "--host" and i + 1 < len(args):
-            host = args[i + 1]
-            i += 2
-        elif args[i] in ("--help", "-h"):
-            print("Usage: python3 -m wizard_server [--host HOST] [--port PORT]")
-            print()
-            print("Starts the Upgrade Wizard server.")
-            print("Default: http://127.0.0.1:8787/")
-            sys.exit(0)
-        else:
-            print(f"Unknown argument: {args[i]}")
-            sys.exit(1)
-
-    start_server(host=host, port=port)
+    start_server(host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

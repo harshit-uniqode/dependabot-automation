@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
-# refresh-dashboard.sh
+# refresh-angular-dashboard.sh
 # Regenerates the Angular Portal vulnerability dashboard.
 #
-# Usage:
-#   ./scripts/refresh-dashboard.sh
+# Usage: ./scripts/refresh-angular-dashboard.sh [owner/repo]
+# Default repo slug: mobstac-private/beaconstac_angular_portal
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_SLUG="${1:-mobstac-private/beaconstac_angular_portal}"
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo " Dependabot Dashboard — Lambda Functions"
+echo " Dependabot Dashboard — Angular Portal"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 if ! gh auth status &>/dev/null; then
@@ -19,9 +20,9 @@ if ! gh auth status &>/dev/null; then
   exit 1
 fi
 
-python3 "$SCRIPT_DIR/generate-dashboard.py" mobstac-private/beaconstac_lambda_functions
+python3 "$SCRIPT_DIR/generate_dashboard.py" "$REPO_SLUG"
 
-DASHBOARD="$SCRIPT_DIR/../vulnerability-tracker/lambda-dashboard.html"
+DASHBOARD="$SCRIPT_DIR/../vulnerability-dashboards/angular-dashboard.html"
 if [ -f "$DASHBOARD" ]; then
   echo "  Opening dashboard in browser..."
   open "$DASHBOARD"

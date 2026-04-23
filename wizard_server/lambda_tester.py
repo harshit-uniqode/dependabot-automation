@@ -11,6 +11,7 @@ Endpoints expected by lambda-dashboard.html:
   GET  /api/lambda/job/<id>            → {"status":"done|running|error","logs":[...],"result":{...}}
 """
 
+import base64
 import json
 import os
 import shutil
@@ -197,8 +198,8 @@ def list_functions(repos_info):
 
 
 def list_events(project_root):
-    """List JSON test events in test-events/."""
-    p = Path(project_root) / "test-events"
+    """List JSON test events in lambda-test-events/."""
+    p = Path(project_root) / "lambda-test-events"
     if not p.is_dir():
         return []
     return sorted([f.name for f in p.glob("*.json")])
@@ -442,7 +443,7 @@ def invoke(fn_meta, event_file, project_root):
 
     def _task():
         fn_name = "local-" + fn_meta["name"].replace("_", "-").lower()
-        event_path = Path(project_root) / "test-events" / event_file
+        event_path = Path(project_root) / "lambda-test-events" / event_file
         if not event_path.exists():
             _finish(jid, "error", {"error": f"Event file not found: {event_file}"})
             return
@@ -474,13 +475,11 @@ def invoke(fn_meta, event_file, project_root):
             invoke_meta = json.loads(stdout) if stdout.strip() else {}
             result["status_code"] = invoke_meta.get("StatusCode")
             result["function_error"] = invoke_meta.get("FunctionError")
-            # Decode base64 log tail
             log_b64 = invoke_meta.get("LogResult")
             if log_b64:
-                import base64
                 try:
                     result["log_tail"] = base64.b64decode(log_b64).decode("utf-8", errors="replace")
-                except Exception:
+                except (ValueError, UnicodeDecodeError):
                     result["log_tail"] = log_b64
         except json.JSONDecodeError:
             pass
