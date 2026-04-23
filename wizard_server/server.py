@@ -7,7 +7,7 @@ from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
-from . import config_schema, repos, jobs as jobs_mod
+from . import config_schema, repos, jobs as jobs_mod, lambda_tester
 
 
 # ─────────────────────────────────────────────────────────────
@@ -62,6 +62,20 @@ class WizardHandler(SimpleHTTPRequestHandler):
             self._handle_get_status(job_id)
         elif path == "/api/health":
             self._json_response(200, {"status": "ok", "version": "0.1.0"})
+        # ── Lambda local testing (GET) ────────────────────────
+        elif path == "/api/lambda/emulator/status":
+            self._json_response(200, lambda_tester.emulator_status())
+        elif path == "/api/lambda/list":
+            self._json_response(200, {"repos": lambda_tester.list_functions(_repos_info)})
+        elif path == "/api/lambda/events":
+            self._json_response(200, {"events": lambda_tester.list_events(_project_root)})
+        elif path.startswith("/api/lambda/job/"):
+            jid = path.split("/api/lambda/job/")[-1]
+            job = lambda_tester.get_job(jid)
+            if not job:
+                self._json_response(404, {"error": "job not found"})
+            else:
+                self._json_response(200, job)
         else:
             # Fall through to static file serving
             super().do_GET()
@@ -81,6 +95,18 @@ class WizardHandler(SimpleHTTPRequestHandler):
         elif path.startswith("/api/cancel/"):
             job_id = path.split("/api/cancel/")[-1]
             self._handle_cancel(job_id)
+        # ── Lambda local testing (POST) ───────────────────────
+        elif path == "/api/lambda/emulator/start":
+            flavour = (body or {}).get("flavour", "floci")
+            jid = lambda_tester.emulator_start(flavour, str(_project_root))
+            self._json_response(202, {"job_id": jid, "status": "starting"})
+        elif path == "/api/lambda/emulator/stop":
+            jid = lambda_tester.emulator_stop(str(_project_root))
+            self._json_response(202, {"job_id": jid, "status": "stopping"})
+        elif path == "/api/lambda/deploy":
+            self._handle_lambda_deploy(body or {})
+        elif path == "/api/lambda/invoke":
+            self._handle_lambda_invoke(body or {})
         else:
             self._json_response(404, {"error": f"Unknown endpoint: {path}"})
 
@@ -194,6 +220,35 @@ class WizardHandler(SimpleHTTPRequestHandler):
             })
             return
         self._json_response(200, status)
+
+    # ── API: Lambda local test ───────────────────────────────
+
+    def _handle_lambda_deploy(self, body):
+        repo_name = body.get("repo")
+        fn_name = body.get("function")
+        if not repo_name or not fn_name:
+            self._json_response(400, {"error": "repo and function required"})
+            return
+        fn_meta = lambda_tester.find_function(_repos_info, repo_name, fn_name)
+        if not fn_meta:
+            self._json_response(404, {"error": f"function not found: {repo_name}/{fn_name}"})
+            return
+        jid = lambda_tester.deploy(fn_meta, str(_project_root))
+        self._json_response(202, {"job_id": jid, "status": "deploying"})
+
+    def _handle_lambda_invoke(self, body):
+        repo_name = body.get("repo")
+        fn_name = body.get("function")
+        event_file = body.get("event")
+        if not repo_name or not fn_name or not event_file:
+            self._json_response(400, {"error": "repo, function, event required"})
+            return
+        fn_meta = lambda_tester.find_function(_repos_info, repo_name, fn_name)
+        if not fn_meta:
+            self._json_response(404, {"error": f"function not found: {repo_name}/{fn_name}"})
+            return
+        jid = lambda_tester.invoke(fn_meta, event_file, str(_project_root))
+        self._json_response(202, {"job_id": jid, "status": "invoking"})
 
     # ── API: Cancel ──────────────────────────────────────────
 

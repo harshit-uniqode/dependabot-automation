@@ -1,14 +1,20 @@
-# Dependabot Vulnerability Remediation — beaconstac_angular_portal
+# Dependabot Vulnerability Remediation
 
 Owner: Harshit (harshit.ky@uniqode.com) | Reviewer: Raghav | Status: Active
 
-This repo is the operational hub for tracking and resolving Dependabot security alerts
-in `mobstac-private/beaconstac_angular_portal`. It contains:
+Operational hub for tracking + fixing Dependabot alerts across:
+- `mobstac-private/beaconstac_angular_portal` (Angular)
+- `mobstac-private/beaconstac_lambda_functions` (48 Lambdas — Node + Python)
 
-- A live vulnerability dashboard (auto-generated HTML, open locally in browser)
-- Local Lambda testing infrastructure (Floci emulator + SAM CLI)
-- Scripts for classifying, triaging, and resolving alerts
-- Documentation for the full fix-test-release workflow
+What's in here:
+
+- **Vulnerability dashboards** — auto-generated HTML, open in browser
+  - `vulnerability-tracker/dashboard.html` — Angular repo alerts
+  - `vulnerability-tracker/lambda-dashboard.html` — Lambda repo alerts + **Local Testing tab**
+- **Wizard server** (`wizard_server/`) — Python HTTP server, backs the dashboards
+- **Local Lambda testing** — Floci emulator, dashboard-driven deploy + invoke
+- **Scripts** — classify/triage/resolve alerts
+- **Docs** — `docs/testing-workflow.md`, `docs/local-lambda-testing.md`
 
 ---
 
@@ -19,19 +25,27 @@ in `mobstac-private/beaconstac_angular_portal`. It contains:
 Install once on your machine:
 
 ```bash
-# GitHub CLI — used to fetch live Dependabot alerts
+# GitHub CLI — fetches live Dependabot alerts
 brew install gh
-gh auth login   # authenticate with your GitHub account (needs repo scope)
+gh auth login                   # needs repo scope
 
-# Python 3 — used by the dashboard generator
-python3 --version   # should be 3.9+
+# Python 3 — used by dashboard generator + wizard server
+python3 --version               # 3.9+
 
-# For local Lambda testing (optional — needed only for Tier 2 testing)
-brew install aws-sam-cli
+# AWS CLI
 brew install awscli
-pip3 install awscli-local
-# Docker Desktop must be running for emulator
+
+# awslocal — pipx isolates it from system Python (PEP 668)
+brew install pipx
+pipx install awscli-local
+pipx ensurepath                 # restart terminal after
+
+# Verify
+which aws awslocal              # both should resolve
+docker ps                       # Docker Desktop must be running
 ```
+
+SAM CLI is NO longer required — the Local Testing tab uses Floci + awslocal directly.
 
 ### 2. Clone this repo
 
@@ -40,18 +54,107 @@ git clone https://github.com/harshit-uniqode/dependabot-automation.git
 cd dependabot-automation
 ```
 
-### 3. Clone the Angular portal (for package.json access)
+### 3. Clone target repos (once per machine)
+
+The wizard server + dashboards expect these paths (configured in `wizard-config.json`):
 
 ```bash
-# The dashboard generator reads package.json from this path to classify deps.
-# If you cloned it elsewhere, update PACKAGE_JSON_PATH in scripts/generate-dashboard.py.
 git clone git@github.com:mobstac-private/beaconstac_angular_portal.git \
   ~/Desktop/Work/beaconstac_angular_portal
+
+git clone git@github.com:mobstac-private/beaconstac_lambda_functions.git \
+  ~/Desktop/Work/beaconstac_lambda_functions
 ```
+
+If you put them elsewhere, edit the `path` fields in `wizard-config.json`.
 
 ---
 
-## Vulnerability Dashboard
+## Running the dashboards
+
+### Start the wizard server (serves both dashboards + Local Testing API)
+
+```bash
+make wizard-server
+# OR:
+python3 -m wizard_server
+```
+
+Output:
+
+```
+  Dashboard:  http://127.0.0.1:8787/
+  API:        http://127.0.0.1:8787/api/
+  ✓ beaconstac_angular_portal (angular)
+  ✓ beaconstac_lambda_functions (lambda_monorepo)
+    48 functions, 1 with tests
+```
+
+Leave this terminal open. Visit:
+
+- **Angular dashboard:** `http://127.0.0.1:8787/vulnerability-tracker/dashboard.html`
+- **Lambda dashboard:** `http://127.0.0.1:8787/vulnerability-tracker/lambda-dashboard.html`
+
+The Lambda dashboard has two tabs: **Vulnerabilities** (default) and **Local Testing**.
+
+### Regenerating dashboard data
+
+```bash
+./scripts/refresh-dashboard.sh            # Angular
+./scripts/refresh-lambda-dashboard.sh     # Lambda
+```
+
+These fetch live Dependabot alerts via `gh`, re-classify deps, and rewrite the HTML.
+
+---
+
+## Local Lambda testing (dashboard-driven)
+
+Full guide: [docs/local-lambda-testing.md](docs/local-lambda-testing.md)
+
+### Flow
+
+1. **Open Lambda dashboard** → click **Local Testing** tab.
+2. **Start emulator** — pick flavour (Floci default, LocalStack optional), click Start. First launch pulls a Docker image (~1 min).
+3. **Pick Lambda** — repo dropdown → function dropdown → function metadata appears (runtime, handler, trigger, services).
+4. **Pick test event** — from `test-events/*.json`.
+5. **Build & Deploy** — wizard server runs `npm install && npm run compile` (or `pip install`), zips, uploads to Floci.
+6. **Invoke** — output panel shows `StatusCode`, `FunctionError` (if any), handler output, and CloudWatch log tail.
+7. **Stop** when done — emulator keeps running otherwise (eats ~400 MB RAM).
+
+### CLI equivalents
+
+Every dashboard action has a Makefile target:
+
+| Dashboard | Terminal |
+|-----------|----------|
+| Start Floci | `make emulator-up` |
+| Start LocalStack | `make emulator-up-localstack` |
+| Stop emulator | `make emulator-down` |
+| Build + deploy Node Lambda | `make lambda-deploy DIR=/path HANDLER=index.handler LANG=node` |
+| Build + deploy Python Lambda | `make lambda-deploy DIR=/path HANDLER=handler.main LANG=python` |
+| Invoke | `make lambda-invoke NAME=local-my-fn EVENT=test-events/sqs-event.json` |
+| List deployed | `make lambda-list` |
+| Tail logs | `make lambda-logs NAME=local-my-fn` |
+| Delete | `make lambda-clean NAME=local-my-fn` |
+
+### Typical Dependabot fix iteration (30 seconds per loop)
+
+```
+1. Open lambda repo → bump the vulnerable package (npm install / edit requirements.txt)
+2. Dashboard Local Testing tab → Build & Deploy
+3. Click Invoke → read output
+4. Fix handler if broken → Build & Deploy → Invoke
+5. Repeat until green → push branch → PR
+```
+
+### Known limitation — aws-sdk v2
+
+Handlers using `require('aws-sdk')` (v2) don't honor `AWS_ENDPOINT_URL` and will hit real AWS. They'll fail at the SES/S3/etc call with `InvalidClientTokenId`. That's fine for Dependabot validation — by that point you've already proven deps load, handler parses the event, and SDK builds the request. Full details in [docs/local-lambda-testing.md](docs/local-lambda-testing.md).
+
+---
+
+## Vulnerability Dashboard — Angular
 
 ### Generate / refresh
 
@@ -61,13 +164,13 @@ git clone git@github.com:mobstac-private/beaconstac_angular_portal.git \
 
 This command:
 1. Checks `gh` CLI auth
-2. Fetches all open Dependabot alerts from `mobstac-private/beaconstac_angular_portal`
-3. Reads `bac-app/package.json` to classify each alert as direct vs sub-dependency
+2. Fetches open Dependabot alerts from `mobstac-private/beaconstac_angular_portal`
+3. Reads `bac-app/package.json` to classify alerts as direct vs sub-dependency
 4. Assigns priority and recommended action per alert
 5. Writes `vulnerability-tracker/dashboard.html`
-6. Opens the dashboard in your default browser
+6. Opens it in your default browser
 
-You can also pass a different repo:
+Pass a different repo:
 
 ```bash
 ./scripts/refresh-dashboard.sh owner/other-repo
@@ -133,32 +236,13 @@ If EPSS > 10%: treat as urgent regardless of CVSS score.
 
 ---
 
-## Local Lambda Testing (Tier 2)
+## Testing tiers
 
-Use when a Lambda reads from SQS, writes to S3/DynamoDB, or uses multiple services.
+Full details: [docs/testing-workflow.md](docs/testing-workflow.md)
 
-```bash
-# Start Floci emulator + create local AWS resources
-make emulator-up
-
-# Invoke Lambda with a test event
-make test-local FUNCTION=MyFunction EVENT=test-events/sqs-event.json
-
-# Check S3/SQS state after invocation
-make verify-resources
-
-# Stop emulator
-make emulator-down
-```
-
-### One-time setup per Lambda
-
-1. Copy `docker-compose.test.yml` and `env.json` into the Lambda repo
-2. Edit `scripts/setup-local-resources.sh` — add your Lambda's S3 buckets, SQS queues, DynamoDB tables
-3. Edit `env.json` — add your Lambda's environment variables
-4. Add test events to `test-events/` matching your trigger type
-
-Full details and Tier 1 (unit mocks) / Tier 3 (staging) instructions: [docs/testing-workflow.md](docs/testing-workflow.md)
+- **Tier 1 — Unit tests with mocks** (fastest, no Docker). `aws-sdk-mock` / `moto`. Good for pure logic.
+- **Tier 2 — Local emulation** (dashboard flow). Floci/LocalStack + awslocal. Proves handler runs + deps load. **Primary Dependabot validation path.**
+- **Tier 3 — Staging deploy**. For SES/Cognito/Step Functions/real traffic shapes. Required before merging runtime critical fixes.
 
 ---
 
@@ -166,55 +250,84 @@ Full details and Tier 1 (unit mocks) / Tier 3 (staging) instructions: [docs/test
 
 ```
 .
-├── README.md                             # This file
+├── README.md                                  # This file
+├── wizard-config.json                         # Repos + server config
 │
-├── Makefile                              # make emulator-up / test-local / verify-resources / ...
-├── docker-compose.test.yml               # Floci emulator (free, MIT)
-├── docker-compose.localstack.yml         # LocalStack variant (needs auth token)
-├── env.json                              # SAM CLI env var overrides for local runs
+├── Makefile                                   # All commands (emulator, deploy, invoke, server)
+├── docker-compose.test.yml                    # Floci emulator (free, MIT, default)
+├── docker-compose.localstack.yml              # LocalStack variant (fallback)
+├── env.json                                   # Legacy SAM CLI env overrides
+│
+├── wizard_server/                             # Python HTTP server (port 8787)
+│   ├── server.py                              # Routes dashboards + API
+│   ├── api.py                                 # /api/analyze /api/test-upgrade
+│   ├── lambda_tester.py                       # /api/lambda/* — Local Testing backend
+│   ├── repos.py                               # Lambda monorepo scanner
+│   ├── pipelines.py                           # Upgrade job runner
+│   ├── jobs.py                                # Async job queue
+│   └── config_schema.py
 │
 ├── scripts/
-│   ├── refresh-dashboard.sh              # ONE COMMAND: fetch alerts → regenerate dashboard → open
-│   ├── generate-dashboard.py             # Dashboard generator (Python 3, no extra deps)
-│   ├── analyze-changelog.sh              # Print changelog URL for a package upgrade
-│   ├── run-test.sh                       # Invoke Lambda + verify S3/SQS output
-│   ├── setup-local-resources.sh          # Create S3/SQS/DynamoDB on local emulator
-│   └── teardown.sh                       # Delete all local emulator resources
+│   ├── refresh-dashboard.sh                   # Angular dashboard regen
+│   ├── refresh-lambda-dashboard.sh            # Lambda dashboard regen
+│   ├── generate-dashboard.py                  # Dashboard HTML generator
+│   ├── analyze-changelog.sh                   # Print changelog URL for a package bump
+│   ├── run-test.sh                            # Invoke Lambda + verify S3/SQS output
+│   ├── setup-local-resources.sh               # Create S3/SQS/DynamoDB on emulator
+│   └── teardown.sh                            # Delete emulator resources
 │
-├── test-events/
-│   ├── sqs-event.json                    # SQS trigger template
-│   ├── s3-event.json                     # S3 ObjectCreated trigger template
-│   ├── api-gateway-event.json            # API Gateway POST trigger template
-│   └── dynamodb-stream-event.json        # DynamoDB stream MODIFY event template
+├── test-events/                               # Event JSON payloads for invoke
+│   ├── sqs-event.json                         # Generic SQS
+│   ├── sqs-email-service.json                 # Tailored for beaconstac_email_service
+│   ├── s3-event.json
+│   ├── api-gateway-event.json
+│   └── dynamodb-stream-event.json
 │
 ├── vulnerability-tracker/
-│   ├── dashboard.html                    # Generated — open in browser (do not edit manually)
-│   ├── hit-list.csv                      # Full alert list — update Status + Resolved At Commit
-│   └── risk-register.csv                 # Risk-accepted items with Raghav approval date
+│   ├── dashboard.html                         # Angular — generated, do not edit
+│   ├── lambda-dashboard.html                  # Lambda + Local Testing tab
+│   ├── hit-list.csv                           # Alert status tracker
+│   └── risk-register.csv                      # Accepted risks + Raghav approval date
 │
 ├── docs/
-│   ├── testing-workflow.md               # Full Tier 1/2/3 testing guide + decision tree
-│   └── dependency-classification-logic.md # How direct vs sub-dep classification works
+│   ├── testing-workflow.md                    # Tier 1/2/3 testing strategy
+│   ├── local-lambda-testing.md                # Local Testing tab — full guide
+│   ├── filtering-workflow.md
+│   └── dependency-classification-logic.md
 │
-└── .github/
-    └── workflows/
-        └── test-dependency-upgrade.yml   # CI: runs integration tests on package.json PRs
+└── .github/workflows/
+    └── test-dependency-upgrade.yml            # CI: integration tests on package.json PRs
 ```
 
 ---
 
-## Key scripts reference
+## Key commands reference
 
 | Command | What it does |
 |---------|-------------|
-| `./scripts/refresh-dashboard.sh` | Fetch live alerts → regenerate dashboard → open browser |
+| `make wizard-server` | Start HTTP server (dashboards + Local Testing API) on :8787 |
+| `./scripts/refresh-dashboard.sh` | Regen Angular dashboard from live alerts |
+| `./scripts/refresh-lambda-dashboard.sh` | Regen Lambda dashboard from live alerts |
 | `./scripts/analyze-changelog.sh npm lodash 4.17.21 4.18.0` | Print changelog URL for review |
-| `./scripts/run-test.sh MyFn test-events/sqs-event.json` | Invoke Lambda + verify output |
-| `make emulator-up` | Start Floci + create AWS resources on localhost:4566 |
-| `make test-local FUNCTION=X EVENT=Y` | Invoke Lambda via SAM CLI against local emulator |
-| `make verify-resources` | List S3/SQS/DynamoDB contents on local emulator |
-| `make emulator-down` | Stop emulator, clean up containers |
-| `make depcheck` | Find unused npm packages in bac-app |
+| `make emulator-up` | Start Floci emulator at localhost:4566 |
+| `make emulator-up-localstack` | Start LocalStack instead (needs `LOCALSTACK_AUTH_TOKEN` for Pro) |
+| `make emulator-down` | Stop emulator + sub-containers |
+| `make lambda-deploy DIR=X HANDLER=Y LANG=node\|python` | Build + zip + deploy Lambda to emulator |
+| `make lambda-invoke NAME=X EVENT=Y` | Invoke deployed Lambda |
+| `make lambda-list` | List deployed Lambdas |
+| `make lambda-logs NAME=X` | Tail CloudWatch logs |
+| `make lambda-clean NAME=X` | Delete deployed Lambda |
+| `make depcheck PATH=/path` | Find unused npm packages |
+
+---
+
+## Troubleshooting (top 3)
+
+**"Server unreachable" in Local Testing tab** — `make wizard-server` not running. Start it in a terminal, leave open.
+
+**Emulator starts but Invoke times out with `LAMBDA_RUNTIME Failed to get next invocation`** — Lambda sub-container can't reach Floci's Runtime API. `docker-compose.test.yml` already has the fix (`FLOCI_SERVICES_LAMBDA_DOCKER_NETWORK`). If still broken, `docker network ls | grep default` and update env var to match your compose project name.
+
+**Handler throws `InvalidClientTokenId` or `Missing credentials in config`** — aws-sdk v2 ignores `AWS_ENDPOINT_URL`. Expected for Dependabot validation (see Known Limitation above). For real mocking, migrate to aws-sdk v3 or wrap SDK client construction.
 
 ---
 

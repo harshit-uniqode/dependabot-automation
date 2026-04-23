@@ -8,6 +8,7 @@ services:
   emulator:
     image: hectorvent/floci:latest
     container_name: lambda-test-emulator
+    hostname: floci
     ports:
       - "4566:4566"
     volumes:
@@ -18,6 +19,18 @@ services:
       - AWS_DEFAULT_REGION=us-east-1
       - AWS_ACCESS_KEY_ID=test
       - AWS_SECRET_ACCESS_KEY=test
+      # ── Lambda sub-container networking ─────────────────────────
+      # Spawned Lambda containers must reach Floci's Runtime API back.
+      # FLOCI_SERVICES_LAMBDA_DOCKER_NETWORK tells Floci which network to
+      # attach the sub-containers to so they can hit the Runtime endpoint.
+      # FLOCI_HOSTNAME tells spawned containers to resolve "floci" instead
+      # of a container IP that may not route.
+      - FLOCI_SERVICES_LAMBDA_DOCKER_NETWORK=localtestingforlambda_default
+      - FLOCI_HOSTNAME=floci
+    networks:
+      default:
+        aliases:
+          - floci
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:4566/_floci/health"]
       interval: 5s

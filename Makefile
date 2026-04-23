@@ -109,6 +109,84 @@ depcheck:
 	@[ -n "$(PATH)" ] || (echo "ERROR: Specify PATH=/path/to/lambda-repo" && exit 1)
 	npx depcheck $(PATH)
 
+# ── Generic Lambda deploy/invoke (CLI equivalents of dashboard Local Testing) ──
+#
+# Usage:
+#   make lambda-deploy DIR=/path/to/fn HANDLER=index.sendEmail RUNTIME=nodejs18.x LANG=node
+#   make lambda-invoke NAME=local-send-email EVENT=test-events/sqs-event.json
+#   make lambda-list
+#   make lambda-logs NAME=local-send-email
+#
+# LANG=node builds via `npm install && npm run compile` (prefers dist/).
+# LANG=python installs requirements into .localtest_pkg/ before zipping.
+
+AWSLOCAL := $(shell command -v awslocal 2>/dev/null || echo "aws --endpoint-url=$(EMULATOR_URL) --region us-east-1 --no-cli-pager")
+
+lambda-deploy:
+	@[ -n "$(DIR)" ]     || (echo "ERROR: Specify DIR=/path/to/function-dir" && exit 1)
+	@[ -n "$(HANDLER)" ] || (echo "ERROR: Specify HANDLER=<file.function>" && exit 1)
+	@[ -n "$(LANG)" ]    || (echo "ERROR: Specify LANG=node|python" && exit 1)
+	@FN_NAME=local-$$(basename $(DIR) | tr '_' '-' | tr A-Z a-z); \
+	RUNTIME=$${RUNTIME:-$$(if [ "$(LANG)" = "python" ]; then echo python3.11; else echo nodejs18.x; fi)}; \
+	echo "Building $$FN_NAME ($(LANG))..."; \
+	cd $(DIR); \
+	if [ "$(LANG)" = "node" ]; then \
+	  npm install --no-audit --no-fund; \
+	  jq -e '.scripts.compile' package.json > /dev/null 2>&1 && npm run compile; \
+	  [ -d dist ] && (cd dist && zip -qr ../function.zip .) || zip -qr function.zip . -x "node_modules/*" ".git/*"; \
+	  zip -qur function.zip node_modules; \
+	elif [ "$(LANG)" = "python" ]; then \
+	  rm -rf .localtest_pkg && mkdir .localtest_pkg; \
+	  [ -f requirements.txt ] && pip3 install -q -r requirements.txt -t .localtest_pkg; \
+	  cp *.py .localtest_pkg/ 2>/dev/null || true; \
+	  find . -maxdepth 1 -mindepth 1 -type d ! -name .localtest_pkg ! -name .git ! -name tests ! -name __pycache__ \
+	    -exec cp -r {} .localtest_pkg/ \; 2>/dev/null || true; \
+	  (cd .localtest_pkg && zip -qr ../function.zip .); \
+	fi; \
+	echo "Deploying $$FN_NAME (runtime=$$RUNTIME, handler=$(HANDLER))..."; \
+	$(AWSLOCAL) lambda update-function-code \
+	  --function-name $$FN_NAME \
+	  --zip-file fileb://$(DIR)/function.zip >/dev/null 2>&1 || \
+	$(AWSLOCAL) lambda create-function \
+	  --function-name $$FN_NAME \
+	  --runtime $$RUNTIME \
+	  --handler $(HANDLER) \
+	  --role arn:aws:iam::000000000000:role/lambda-role \
+	  --zip-file fileb://$(DIR)/function.zip \
+	  --timeout 60 --memory-size 256; \
+	$(AWSLOCAL) lambda wait function-active-v2 --function-name $$FN_NAME; \
+	echo "Deployed $$FN_NAME"
+
+lambda-invoke:
+	@[ -n "$(NAME)" ]  || (echo "ERROR: Specify NAME=<function-name>" && exit 1)
+	@[ -n "$(EVENT)" ] || (echo "ERROR: Specify EVENT=<path/to/event.json>" && exit 1)
+	$(AWSLOCAL) lambda invoke \
+	  --function-name $(NAME) \
+	  --payload fileb://$(EVENT) \
+	  --cli-binary-format raw-in-base64-out \
+	  --log-type Tail \
+	  /tmp/lambda-out.json | jq -r '.LogResult // ""' | base64 -d 2>/dev/null || true
+	@echo "── Output ──"
+	@cat /tmp/lambda-out.json; echo
+
+lambda-list:
+	$(AWSLOCAL) lambda list-functions --query 'Functions[].FunctionName' --output table
+
+lambda-logs:
+	@[ -n "$(NAME)" ] || (echo "ERROR: Specify NAME=<function-name>" && exit 1)
+	$(AWSLOCAL) logs tail /aws/lambda/$(NAME) --follow
+
+lambda-clean:
+	@[ -n "$(NAME)" ] || (echo "ERROR: Specify NAME=<function-name>" && exit 1)
+	$(AWSLOCAL) lambda delete-function --function-name $(NAME)
+
+# ── Wizard server (serves dashboard + local-test API) ─────────────────────────
+
+wizard-server:
+	@python3 -m wizard_server
+
 .PHONY: emulator-up emulator-up-localstack emulator-down logs health \
         setup-resources teardown-resources test-local test-all \
-        verify-resources depcheck
+        verify-resources depcheck \
+        lambda-deploy lambda-invoke lambda-list lambda-logs lambda-clean \
+        wizard-server

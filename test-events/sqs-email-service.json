@@ -1,0 +1,20 @@
+{
+  "Records": [
+    {
+      "messageId": "local-test-001",
+      "receiptHandle": "test-receipt-handle",
+      "body": "{\"email_type\":\"template\",\"emails\":[\"success@simulator.amazonses.com\"],\"template\":\"<h1>Hello from local</h1>\",\"subject\":\"Local test\",\"email_source\":\"noreply@uniqode.com\",\"sender_name\":\"Uniqode\",\"reply_to\":[\"support@uniqode.com\"],\"initiator\":\"local-test\"}",
+      "attributes": {
+        "ApproximateReceiveCount": "1",
+        "SentTimestamp": "1713196800000",
+        "SenderId": "000000000000",
+        "ApproximateFirstReceiveTimestamp": "1713196800001"
+      },
+      "messageAttributes": {},
+      "md5OfBody": "d41d8cd98f00b204e9800998ecf8427e",
+      "eventSource": "aws:sqs",
+      "eventSourceARN": "arn:aws:sqs:us-east-1:000000000000:local-beaconstac-email-service",
+      "awsRegion": "us-east-1"
+    }
+  ]
+}
