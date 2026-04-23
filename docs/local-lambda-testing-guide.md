@@ -360,6 +360,133 @@ dependabot-vulnerability-tracker/
 
 ---
 
+## How the testing actually works — surface + deep view
+
+### Surface view (2-minute mental model)
+
+When you click **Test in Floci**, three actors cooperate:
+
+1. **Your Lambda code** on disk — handler + `requirements.txt` / `package.json`.
+2. **Wizard server** (local Python HTTP server on :8787) — packages code, uploads to emulator.
+3. **Floci emulator** (Docker container on :4566) — runs AWS services (Lambda, SQS, S3, DynamoDB, SES, etc.) locally. Your Lambda runs inside a **sub-container** Floci spawns.
+
+Click flow:
+- **Deploy** → wizard installs deps + zips code + calls `awslocal lambda create-function` → Floci pulls runtime image (`public.ecr.aws/lambda/python:3.X`) → creates function.
+- **Invoke** → wizard calls `awslocal lambda invoke --payload <event.json>` → Floci spins Lambda sub-container, runs handler → returns statusCode + response body.
+
+Your handler code runs **unchanged** — same Python/Node code as qa/prod. Only difference: AWS SDK calls go to `http://floci:4566` (Floci) instead of `https://sqs.us-east-1.amazonaws.com` (real AWS).
+
+### Deep view — what happens under the hood
+
+#### Step 1: dep packaging (the trickiest part)
+
+For Python Lambdas with native-extension deps (`cryptography`, `pydantic-core`, `orjson`), you **cannot** just `pip install` on your Mac and zip the result. Why:
+
+- `cryptography` ships a compiled `_rust.abi3.so` file per platform (Mac-ARM64, Linux-x86_64, Linux-ARM64).
+- Lambda runs on Linux. The Mac `.so` has a different ELF header → `Runtime.ImportModuleError: invalid ELF header` at handler import.
+
+Wizard solves this by running pip **inside** a Lambda runtime Docker container:
+
+```
+docker run --rm --platform linux/<host-arch> \
+  -v $FN_DIR:/var/task \
+  public.ecr.aws/lambda/python:3.9 \
+  pip install -r /var/task/requirements.txt -t /var/task/.localtest_pkg
+```
+
+This is the same trick `serverless-python-requirements` does with `dockerizePip: true`. The deps written to `.localtest_pkg/` are now Linux-native.
+
+**Arch gotcha:** Floci Lambda sub-containers run **host-native arch**, not x86_64. On Apple Silicon, `uname -m` = `arm64` → Floci Lambda container = `aarch64` → packaged deps must be Linux ARM64. Wizard detects this with `platform.machine()` and chooses `linux/arm64` vs `linux/amd64` automatically.
+
+Wrong-arch `.so` on ARM CPU gives a **misleading error**: `cannot open shared object file: No such file or directory` — even though the file is physically present. That's Linux's dynamic loader refusing to load cross-arch ELF.
+
+#### Step 2: the zip
+
+Wizard zips `.localtest_pkg/` contents at zip root (not nested). Lambda runtime expects handler importable from `/var/task`, so `/var/task/handler.py` + `/var/task/cryptography/...` must sit at root. Typical zip is 20-40 MB for Python Lambdas with `cryptography` + `boto3` + `requests`.
+
+For Node Lambdas, wizard runs `npm install`, zips `node_modules/` + source, handling TypeScript `dist/` output.
+
+#### Step 3: upload to Floci
+
+```
+awslocal lambda create-function \
+  --function-name local-<dir-name-hyphenated> \
+  --runtime python3.9 \
+  --handler handler.lambda_handler \
+  --zip-file fileb://function.zip \
+  --timeout 60 \
+  --memory-size 256 \
+  --environment Variables={AWS_ENDPOINT_URL=http://floci:4566,STAGE=local,...}
+```
+
+`AWS_ENDPOINT_URL=http://floci:4566` is the magic that makes `boto3.client('sqs')` inside the Lambda hit Floci's SQS instead of real AWS.
+
+#### Step 4: invoke
+
+```
+awslocal lambda invoke \
+  --function-name local-forms-response-sync-service \
+  --payload fileb://./lambda-test-events/sqs-email-service.json \
+  --cli-binary-format raw-in-base64-out \
+  --log-type Tail \
+  ./.localtest_out/<job_id>.json
+```
+
+Floci spawns a fresh Lambda sub-container from the Python runtime image, mounts the zip contents as `/var/task`, starts the Python process with `handler.lambda_handler` as entrypoint, injects the event payload via Lambda Runtime API. The handler runs, returns a dict, Floci writes it to `.localtest_out/<job_id>.json`, wizard reads it + shows it in the UI.
+
+#### Step 5: interpretation
+
+The UI pass/fail banner reads three fields:
+
+| Field | Interpretation |
+|-------|---------------|
+| `job.status === 'done'` | Wizard subprocess succeeded (no timeout, no subprocess error) |
+| `result.status_code === 200` | Lambda responded (AWS says statusCode 200 on successful invocation — 500/503 means Lambda itself crashed) |
+| `result.function_error === null` | Handler did not raise unhandled exception |
+
+All three → ✅ PASS. Any one missing → ❌ FAIL with reason.
+
+### Common failure modes + diagnosis
+
+| Symptom | Root cause | Where to look |
+|---------|-----------|---------------|
+| `invalid ELF header` | Host-arch `.so` in zip | `file .localtest_pkg/<pkg>/*.so` — check arch |
+| `cannot open shared object file` (file exists) | Wrong arch `.so` on ARM/x86 CPU mismatch | `uname -m` vs `file` on `.so` |
+| `content digest sha256:X not found` | Floci cached stale image digest | Restart Floci: `docker restart lambda-test-emulator` |
+| Invoke hangs 120s → `timed out` | Floci killed Lambda at its own 60s timeout | `docker logs lambda-test-emulator \| grep ImportModuleError` — usually init error |
+| `Runtime.ImportModuleError: No module named 'X'` | Missing from `requirements.txt` | Add it, redeploy |
+| Deploy succeeds, invoke returns `500` with traceback | Handler bug | The traceback is in the invoke result — read it |
+| `function not found: beaconstac_lambda_functions/...` | Dashboard sent wrong function name | See `feedback_local_testing_deploy_name_mismatch.md` memory — pass dir name verbatim |
+
+### Why we use Floci (not LocalStack direct, not SAM)
+
+| Tool | Lambda | SQS/SNS | S3 | DynamoDB | SES | Cost | Notes |
+|------|--------|---------|-----|----------|-----|------|-------|
+| **Floci** | ✅ | ✅ | ✅ | ✅ | ✅ | Free | LocalStack fork, single Docker container |
+| **LocalStack Free** | ❌ | ✅ | ✅ | ✅ | ✅ | Free | Lambda requires Pro tier |
+| **LocalStack Pro** | ✅ | ✅ | ✅ | ✅ | ✅ | ~$35/mo | Full parity with AWS |
+| **SAM local** | ✅ | ❌ | ❌ | ❌ | ❌ | Free | Lambda only — you wire external emulators yourself |
+| **Docker Compose mock** | DIY | ❌ | ❌ | ❌ | ❌ | Free | Completely manual |
+
+**Why Floci wins for our use case:**
+
+1. **Lambda is the core requirement.** We're testing Lambda handlers after a dep bump. SAM local does Lambda but nothing else — every `boto3.client('sqs').send_message(...)` inside the handler would need a separate SQS mock. Floci gives us all of them in one container.
+
+2. **It's free and zero-config.** We don't need a real AWS account, no `localstack` auth tokens, no `~/.localstack` config. One Docker container, one `FLOCI_SERVICES_LAMBDA_DOCKER_NETWORK` env var, done.
+
+3. **It uses the real Lambda runtime image.** Floci runs your handler inside `public.ecr.aws/lambda/python:3.9` — the same image AWS uses. If the handler boots there, it'll boot in production. SAM local also uses real runtime images; pure mock solutions don't.
+
+4. **The `awslocal` CLI is identical to `aws`.** All commands (`lambda create-function`, `sqs send-message`, `s3 cp`) work unchanged. The wrapper just routes to `http://localhost:4566`. No extra SDK config needed in test scripts.
+
+5. **SES is emulated (no real emails sent).** The handler can call `ses.send_email()` and it won't actually send. Floci logs the call. For email Lambda testing this is critical — SES in real AWS requires domain verification, sandbox mode, etc.
+
+**When to switch to LocalStack Pro:**
+If you hit a Floci compatibility bug, or need a service Floci doesn't fully support (Kinesis streams, Step Functions, EventBridge rules, Cognito). The Local Testing tab already has a flavour dropdown for this.
+
+Floci has rough edges (the arch gotcha, the image-digest caching) but the alternative of deploying to qa every time is 10x slower.
+
+---
+
 ## Where to file bugs
 
 If something's wrong with the Local Testing tab:
