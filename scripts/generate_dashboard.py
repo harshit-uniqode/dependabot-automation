@@ -1490,9 +1490,10 @@ function renderTable() {{
         ? `<a href="${{escHtml(r.changelogUrl)}}" target="_blank" rel="noopener" class="changelog-link">View changelog ${{LINK_ICON}}</a>`
         : '<span style="color:var(--text-muted)">N/A</span>';
 
-      const lambdaName = r.functionName ? 'local-' + r.functionName.replace(/_/g, '-') : '';
+      // Pass the raw directory name (r.functionName) — wizard server expects dir name verbatim.
+      // Lambda display name (local-*) is computed inside ltOpen for the modal title only.
       const testBtn = (IS_LAMBDA_REPO && r.functionName)
-        ? `<button onclick="event.stopPropagation();ltOpen('${{lambdaName}}')" style="margin-left:8px;padding:3px 10px;background:var(--blue);color:white;border:none;border-radius:var(--radius-sm);cursor:pointer;font-size:11px;font-weight:600">&#129514; Test in Floci</button>`
+        ? `<button onclick="event.stopPropagation();ltOpen('${{escHtml(r.functionName)}}')" style="margin-left:8px;padding:3px 10px;background:var(--blue);color:white;border:none;border-radius:var(--radius-sm);cursor:pointer;font-size:11px;font-weight:600">&#129514; Test in Floci</button>`
         : '';
       const fnField = r.functionName
         ? `<div class="detail-field"><label>Function</label><p><code>${{escHtml(r.functionName)}}</code>${{testBtn}}</p></div>`
@@ -1600,10 +1601,14 @@ function renderResolvedBanner() {{
 let ltCurrentFn = null;
 let ltEvents = [];
 
-async function ltOpen(functionName) {{
-  if (!functionName) return;
-  ltCurrentFn = functionName;
-  document.getElementById('lt-fn').textContent = functionName;
+async function ltOpen(dirName) {{
+  // dirName = actual Lambda function directory name (e.g. "forms-response-sync-service" or "beaconstac_pdf_compressor").
+  // This is what wizard_server expects verbatim — DO NOT mutate it.
+  if (!dirName) return;
+  ltCurrentFn = dirName;
+  // Display label: prefix with "local-" and normalise underscores to hyphens for readability only.
+  const displayName = 'local-' + dirName.replace(/_/g, '-');
+  document.getElementById('lt-fn').textContent = displayName;
   document.getElementById('lt-status').textContent = 'Loading test events...';
   document.getElementById('lt-invoke-btn').disabled = true;
   document.getElementById('lt-invoke-btn').style.opacity = '.5';
@@ -1615,7 +1620,9 @@ async function ltOpen(functionName) {{
     ltEvents = data.events || [];
     const sel = document.getElementById('lt-event');
     sel.innerHTML = ltEvents.map(e => `<option value="${{escHtml(e)}}">${{escHtml(e)}}</option>`).join('');
-    const preferred = ltEvents.find(e => e.toLowerCase().includes(functionName.toLowerCase().replace(/^local-/, '').split('-')[0]));
+    // Pick an event whose name shares a keyword with the dir name (hyphens or underscores split).
+    const fnTokens = dirName.toLowerCase().split(/[-_]/).filter(t => t.length > 3);
+    const preferred = ltEvents.find(e => fnTokens.some(t => e.toLowerCase().includes(t)));
     if (preferred) sel.value = preferred;
     document.getElementById('lt-status').textContent = `Ready. ${{ltEvents.length}} event file(s) available.\\nClick "Build & Deploy" to start.`;
   }} catch (e) {{
@@ -1637,56 +1644,75 @@ function ltAppend(msg) {{
 async function ltPollJob(jobId) {{
   const spinner = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
   const statusEl = document.getElementById('lt-status');
-  // Append live-status line; we'll rewrite the last line every tick.
-  statusEl.textContent += '\\n⏱ 0s  polling...';
-  statusEl.scrollTop = statusEl.scrollHeight;
+  const baseText = statusEl.textContent;  // freeze prefix; we rebuild tail each tick
   const start = Date.now();
+  let seenLogs = 0;
+  let lastData = null;
   for (let i = 0; i < 300; i++) {{
     await new Promise(r => setTimeout(r, 1000));
     const res = await fetch(`${{WIZARD_BASE}}/api/lambda/job/${{jobId}}`);
     const data = await res.json();
+    lastData = data;
     const elapsed = Math.round((Date.now() - start) / 1000);
-    const lastLog = (data.logs && data.logs.length) ? data.logs[data.logs.length - 1] : '';
-    const tail = lastLog ? ` — ${{lastLog.slice(0, 80)}}` : '';
-    // Rewrite last line of status with live timer
+    const logs = data.logs || [];
+    // Emit any NEW log lines permanently to baseText
+    if (logs.length > seenLogs) {{
+      const fresh = logs.slice(seenLogs).join('\\n');
+      statusEl.textContent = statusEl.textContent + '\\n' + fresh;
+      seenLogs = logs.length;
+    }}
+    // Live timer line at bottom — rewrite each tick
+    const header = `\\n${{spinner[i % spinner.length]}} ${{elapsed}}s elapsed  status=${{data.status}}  (${{logs.length}} log lines)`;
+    // Strip previous timer line if exists, append new
     const lines = statusEl.textContent.split('\\n');
-    lines[lines.length - 1] = `${{spinner[i % spinner.length]}} ${{elapsed}}s  status=${{data.status}}${{tail}}`;
-    statusEl.textContent = lines.join('\\n');
+    if (lines.length && lines[lines.length - 1].match(/^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] \\d+s elapsed/)) {{
+      lines.pop();
+    }}
+    statusEl.textContent = lines.join('\\n') + header;
     statusEl.scrollTop = statusEl.scrollHeight;
-    if (data.status === 'done' || data.status === 'error') return data;
+    if (data.status === 'done' || data.status === 'error') {{
+      // Strip the spinner line on completion
+      const finalLines = statusEl.textContent.split('\\n');
+      if (finalLines.length && finalLines[finalLines.length - 1].match(/^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/)) {{
+        finalLines.pop();
+        statusEl.textContent = finalLines.join('\\n');
+      }}
+      return data;
+    }}
   }}
   throw new Error('Timeout waiting for job (5 min)');
 }}
 
-function ltLambdaNameToDirName(lambdaName) {{
-  // local-forms-response-sync-service → forms_response_sync_service
-  return lambdaName
-    .replace(/^local-/, '')  // strip 'local-' prefix
-    .replace(/-/g, '_');      // hyphens → underscores
-}}
+// NOTE: ltCurrentFn stores the raw directory name (matches disk, from r.functionName).
+// Send it verbatim to wizard_server — do NOT rewrite hyphens/underscores.
+// Lambda dir naming is inconsistent on disk (e.g. "beaconstac_pdf_compressor" vs
+// "forms-response-sync-service"), so any string conversion is lossy.
 
 async function ltDeploy() {{
   if (!ltCurrentFn) return;
   const repoName = IS_LAMBDA_REPO ? 'beaconstac_lambda_functions' : null;
   if (!repoName) {{ ltAppend('Local Testing only supported for Lambda repo.'); return; }}
-  const dirName = ltLambdaNameToDirName(ltCurrentFn);
   document.getElementById('lt-deploy-btn').disabled = true;
-  ltAppend(`[deploy] POST /api/lambda/deploy  repo=${{repoName}}  function=${{dirName}}`);
+  ltAppend(`[deploy] POST /api/lambda/deploy  repo=${{repoName}}  function=${{ltCurrentFn}}`);
   try {{
     const res = await fetch(`${{WIZARD_BASE}}/api/lambda/deploy`, {{
       method: 'POST',
       headers: {{ 'Content-Type': 'application/json' }},
-      body: JSON.stringify({{ repo: repoName, function: dirName }})
+      body: JSON.stringify({{ repo: repoName, function: ltCurrentFn }})
     }});
     const data = await res.json();
     if (!data.job_id) {{ ltAppend(`[deploy] ERROR: ${{JSON.stringify(data)}}`); document.getElementById('lt-deploy-btn').disabled = false; return; }}
-    ltAppend(`[deploy] job_id=${{data.job_id}}  polling...`);
+    ltAppend(`[deploy] job_id=${{data.job_id}}`);
     const job = await ltPollJob(data.job_id);
-    const logTail = (job.logs || []).slice(-20).join('\\n');
-    ltAppend(`[deploy] ${{job.status}}\\n${{logTail}}`);
+    ltAppend(`[deploy] ✓ finished: ${{job.status}}`);
+    const bar = '═'.repeat(60);
     if (job.status === 'done') {{
       document.getElementById('lt-invoke-btn').disabled = false;
       document.getElementById('lt-invoke-btn').style.opacity = '1';
+      ltAppend(`\\n${{bar}}\\n✅ DEPLOY OK — ready to invoke\\n${{bar}}`);
+    }} else {{
+      const err = (job.result && job.result.error) || 'unknown error';
+      ltAppend(`\\n${{bar}}\\n❌ DEPLOY FAILED — ${{err}}\\n${{bar}}`);
     }}
   }} catch (e) {{
     ltAppend(`[deploy] EXCEPTION: ${{e.message}}`);
@@ -1698,7 +1724,6 @@ async function ltDeploy() {{
 async function ltInvoke() {{
   if (!ltCurrentFn) return;
   const repoName = 'beaconstac_lambda_functions';
-  const dirName = ltLambdaNameToDirName(ltCurrentFn);
   const event = document.getElementById('lt-event').value;
   document.getElementById('lt-invoke-btn').disabled = true;
   ltAppend(`[invoke] POST /api/lambda/invoke  event=${{event}}`);
@@ -1706,16 +1731,32 @@ async function ltInvoke() {{
     const res = await fetch(`${{WIZARD_BASE}}/api/lambda/invoke`, {{
       method: 'POST',
       headers: {{ 'Content-Type': 'application/json' }},
-      body: JSON.stringify({{ repo: repoName, function: dirName, event: event }})
+      body: JSON.stringify({{ repo: repoName, function: ltCurrentFn, event: event }})
     }});
     const data = await res.json();
     if (!data.job_id) {{ ltAppend(`[invoke] ERROR: ${{JSON.stringify(data)}}`); document.getElementById('lt-invoke-btn').disabled = false; return; }}
-    ltAppend(`[invoke] job_id=${{data.job_id}}  polling...`);
+    ltAppend(`[invoke] job_id=${{data.job_id}}`);
     const job = await ltPollJob(data.job_id);
-    ltAppend(`[invoke] ${{job.status}}`);
+    ltAppend(`[invoke] ✓ finished: ${{job.status}}`);
     if (job.result) ltAppend(`result:\\n${{JSON.stringify(job.result, null, 2)}}`);
-    const logTail = (job.logs || []).slice(-30).join('\\n');
-    if (logTail) ltAppend(`logs:\\n${{logTail}}`);
+
+    // ── PASS/FAIL BANNER ───────────────────────────────────
+    const r = job.result || {{}};
+    const pass = job.status === 'done' && r.status_code === 200 && !r.function_error;
+    const fail = job.status === 'error' || r.function_error || (r.status_code && r.status_code !== 200);
+    const banner = `\\n${{'═'.repeat(60)}}\\n`;
+    if (pass) {{
+      ltAppend(`${{banner}}✅ LAMBDA PASSED — statusCode=${{r.status_code}}, no errors\\n${{'═'.repeat(60)}}`);
+    }} else if (fail) {{
+      const why = r.function_error
+        ? `functionError=${{r.function_error}}`
+        : r.error
+          ? `error=${{r.error}}`
+          : `statusCode=${{r.status_code || 'unknown'}}`;
+      ltAppend(`${{banner}}❌ LAMBDA FAILED — ${{why}}\\n${{'═'.repeat(60)}}`);
+    }} else {{
+      ltAppend(`${{banner}}⚠️  LAMBDA UNKNOWN STATE — check result above\\n${{'═'.repeat(60)}}`);
+    }}
   }} catch (e) {{
     ltAppend(`[invoke] EXCEPTION: ${{e.message}}`);
   }} finally {{

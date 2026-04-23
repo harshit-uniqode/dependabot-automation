@@ -14,6 +14,7 @@ Endpoints expected by lambda-dashboard.html:
 import base64
 import json
 import os
+import platform
 import shutil
 import subprocess
 import threading
@@ -254,8 +255,17 @@ def _build_node(fn_dir, jid):
     return True, "ok"
 
 
-def _build_python(fn_dir, jid):
-    """pip install -r requirements.txt -t pkg/."""
+def _build_python(fn_dir, jid, runtime="python3.9"):
+    """pip install -r requirements.txt -t pkg/ INSIDE Lambda Linux container.
+
+    CONTRACT: Host pip install is broken for packages with native extensions
+    (cryptography, pydantic-core, orjson, etc.) — they ship platform-specific
+    .so files. Host-arch wheels won't load in the Lambda container. We must
+    build deps using the same arch as the Lambda runtime container — and
+    Floci runs Lambda containers matching the HOST arch (no cross-arch
+    emulation by default). So the build platform must match host arch.
+    This mirrors `serverless-python-requirements` `dockerizePip: true`.
+    """
     pkg_dir = Path(fn_dir) / ".localtest_pkg"
     if pkg_dir.exists():
         shutil.rmtree(pkg_dir, ignore_errors=True)
@@ -263,12 +273,23 @@ def _build_python(fn_dir, jid):
 
     req = Path(fn_dir) / "requirements.txt"
     if req.exists():
+        # Map runtime (e.g. "python3.9") to Lambda base image
+        py_ver = runtime.replace("python", "") if runtime.startswith("python") else "3.9"
+        image = f"public.ecr.aws/lambda/python:{py_ver}"
+        # Detect host arch — Floci Lambda containers run host-native arch
+        host_arch = platform.machine().lower()
+        docker_platform = "linux/arm64" if host_arch in ("arm64", "aarch64") else "linux/amd64"
+        _log(jid, f"Building deps in {image} ({docker_platform}) — matches Floci Lambda container arch")
         rc, _, _ = _run(
-            ["pip3", "install", "-r", str(req), "-t", str(pkg_dir), "--quiet"],
-            cwd=fn_dir, timeout=300, jid=jid,
+            ["docker", "run", "--rm", "--platform", docker_platform,
+             "--entrypoint", "/bin/sh",
+             "-v", f"{Path(fn_dir).resolve()}:/var/task",
+             image, "-c",
+             f"pip install -r /var/task/requirements.txt -t /var/task/.localtest_pkg --quiet"],
+            cwd=fn_dir, timeout=600, jid=jid,
         )
         if rc != 0:
-            return False, "pip install failed"
+            return False, "docker pip install failed"
 
     # Copy handler source files into pkg dir
     for item in Path(fn_dir).iterdir():
@@ -287,7 +308,7 @@ def _build_python(fn_dir, jid):
     return True, str(pkg_dir)
 
 
-def build_zip(fn_dir, language, jid):
+def build_zip(fn_dir, language, jid, runtime="python3.9"):
     """Build artifact and produce function.zip in fn_dir. Return (ok, zip_path_or_error)."""
     fn_dir = Path(fn_dir)
     zip_path = fn_dir / "function.zip"
@@ -314,7 +335,7 @@ def build_zip(fn_dir, language, jid):
         return True, {"zip": str(zip_path)}
 
     if language == "python":
-        ok, pkg_dir = _build_python(fn_dir, jid)
+        ok, pkg_dir = _build_python(fn_dir, jid, runtime=runtime)
         if not ok:
             return False, pkg_dir
         _log(jid, f"Zipping {pkg_dir} → {zip_path}")
@@ -366,8 +387,8 @@ def deploy(fn_meta, project_root):
             _finish(jid, "error", {"error": "Neither awslocal nor aws CLI found. Install with: pip install awscli-local"})
             return
 
-        _log(jid, f"Building {fn_meta['name']} ({language})...")
-        ok, result = build_zip(fn_dir, language, jid)
+        _log(jid, f"Building {fn_meta['name']} ({language}, runtime={runtime})...")
+        ok, result = build_zip(fn_dir, language, jid, runtime=runtime)
         if not ok:
             _finish(jid, "error", {"error": result})
             return
@@ -500,6 +521,16 @@ def invoke(fn_meta, event_file, project_root):
 # ─────────────────────────────────────────────────────────────
 
 def find_function(repos_info, repo_name, function_name):
+    """Look up a Lambda function by its on-disk directory name.
+
+    CONTRACT: `function_name` is the literal directory name as it exists on disk
+    (e.g. `beaconstac_pdf_compressor` OR `forms-response-sync-service`).
+    Directory naming is inconsistent — some use underscores, some hyphens.
+
+    Do NOT translate hyphens ↔ underscores in callers. Pass the dir name verbatim.
+    The Lambda runtime name (`local-<hyphenated>`) is derived here in deploy/invoke
+    via `.replace("_", "-").lower()` — that conversion is wizard-internal only.
+    """
     for ri in repos_info:
         if ri["name"] != repo_name:
             continue
