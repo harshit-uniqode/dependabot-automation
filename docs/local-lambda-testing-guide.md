@@ -367,12 +367,13 @@ dependabot-vulnerability-tracker/
 When you click **Test in Floci**, three actors cooperate:
 
 1. **Your Lambda code** on disk — handler + `requirements.txt` / `package.json`.
-2. **Wizard server** (local Python HTTP server on :8787) — packages code, uploads to emulator.
+2. **Wizard server** (local Python HTTP server on :8787) — packages code, uploads to emulator, seeds resources.
 3. **Floci emulator** (Docker container on :4566) — runs AWS services (Lambda, SQS, S3, DynamoDB, SES, etc.) locally. Your Lambda runs inside a **sub-container** Floci spawns.
 
-Click flow:
-- **Deploy** → wizard installs deps + zips code + calls `awslocal lambda create-function` → Floci pulls runtime image (`public.ecr.aws/lambda/python:3.X`) → creates function.
-- **Invoke** → wizard calls `awslocal lambda invoke --payload <event.json>` → Floci spins Lambda sub-container, runs handler → returns statusCode + response body.
+Three-button click flow in the modal:
+- **1. Build & Deploy** → wizard installs deps + zips code + calls `awslocal lambda create-function` → Floci pulls runtime image → creates function.
+- **2. Seed Resources** → wizard parses `serverless.yml` + handler source → creates the S3 buckets, SQS queues, DDB tables, SES identities the Lambda expects → uploads any `tests/fixtures/*` to the first detected bucket. Idempotent — safe to click multiple times.
+- **3. Invoke** → wizard calls `awslocal lambda invoke --payload <event.json>` → Floci spins Lambda sub-container, runs handler → returns statusCode + response body.
 
 Your handler code runs **unchanged** — same Python/Node code as qa/prod. Only difference: AWS SDK calls go to `http://floci:4566` (Floci) instead of `https://sqs.us-east-1.amazonaws.com` (real AWS).
 
@@ -457,6 +458,12 @@ All three → ✅ PASS. Any one missing → ❌ FAIL with reason.
 | `Runtime.ImportModuleError: No module named 'X'` | Missing from `requirements.txt` | Add it, redeploy |
 | Deploy succeeds, invoke returns `500` with traceback | Handler bug | The traceback is in the invoke result — read it |
 | `function not found: beaconstac_lambda_functions/...` | Dashboard sent wrong function name | See `feedback_local_testing_deploy_name_mismatch.md` memory — pass dir name verbatim |
+| Deploy hangs at "Zipping..." for minutes | Output zip `function.zip` gets included in its own zip → recursive self-zip. Happened 2026-04-24 with pdf_compressor → 105GB zip | Delete `function.zip` from function dir; redeploy. Fixed in `_zip_dir` by skipping the output path from walk |
+| Build timeout at 5 min | Large TS repos (pdf_compressor: 300MB node_modules, 28K files) take 3-5 min to zip | Poll timeout bumped to 15 min; granular zip progress log shows file count + size every 2s |
+| `String value length (X) exceeds maximum` on deploy | Zip > Floci's 100MB JSON inline limit | Deploy auto-switches to S3 upload path for zips > 50MB. If manual: `awslocal s3 cp function.zip s3://floci-lambda-code/k.zip` then `awslocal lambda create-function --code S3Bucket=floci-lambda-code,S3Key=k.zip` |
+| `Handler file 'dist/index' not found in deployment package` | TS Lambda not compiled; no npm compile/build script | Wizard now runs `npx tsc` as fallback when tsconfig.json exists |
+| `NoSuchBucket` / `QueueDoesNotExist` in handler error | S3 bucket/SQS queue not seeded in Floci | Click **Seed Resources** button after Deploy. Parses serverless.yml + source to detect resources |
+| `MissingRequiredParameter: Key` | Test event doesn't match handler's expected payload shape | Pick a different event from dropdown, or create custom `lambda-test-events/*.json` matching handler signature |
 
 ### Why we use Floci (not LocalStack direct, not SAM)
 
@@ -502,4 +509,57 @@ If something's wrong with the Local Testing tab:
 - Per-Lambda `local-test.json` file in each function dir specifying custom build commands, required secrets, and default event template. Right now the server uses defaults derived from `serverless.yml`.
 - Auto-seed Secrets Manager with dummy values so SES/Datadog functions work without manual `awslocal secretsmanager create-secret`.
 - One-click "test this fix" button on each Dependabot alert row in the Vulnerabilities tab — switches to Local Testing tab with the right function pre-selected.
-- LocalStack Pro hot-reload integration for Node Lambdas (`mountCode: true`) — removes the rebuild step entirely.
+- **Reactive S3 Sync**: deploy Lambda via `Code.S3Bucket='local-code'` + `S3Key`. On code change, re-upload to S3 key → Floci automatically drains warm containers. Faster iteration than redeploying each time. Tracked in `feedback_lambda_native_deps_arch.md` memory.
+- **Ephemeral mode toggle** in UI: checkbox "Cold-start every invoke" → sets `FLOCI_SERVICES_LAMBDA_EPHEMERAL=true`. Use when debugging intermittent warm-container state issues.
+- **Remote debugger attach** (bigger lift): bake `debugpy` / `--inspect-brk` into Lambda runtime image, expose port, add VS Code launch.json. See reference_localstack_youtube_learnings.md memory for the pattern.
+
+---
+
+## Floci configuration reference
+
+Our `docker/floci-emulator.compose.yml` sets these env vars (full reference in `reference_floci_complete.md` memory):
+
+| Var | Value | Why |
+|-----|-------|-----|
+| `FLOCI_SERVICES_LAMBDA_DOCKER_NETWORK` | `dependabotvulnerabilitytracker_default` | Lambda sub-containers join this network to reach Floci's Runtime API. Derived from Docker Compose project name (dir name lowercased). |
+| `FLOCI_HOSTNAME` | `floci` | Lambda containers resolve `http://floci:4566` for AWS SDK calls — matches the service alias on the network. Without this, `AWS_ENDPOINT_URL=http://floci:4566` inside Lambda wouldn't resolve. |
+| `FLOCI_STORAGE_MODE` | `hybrid` | In-memory for hot path, periodic flush to `/app/data` so Lambda code / S3 / DDB survive Floci restarts. Default (in shipped yml) is `memory` — we override. |
+| `FLOCI_SERVICES_LAMBDA_CONTAINER_IDLE_TIMEOUT_SECONDS` | `300` | Warm pool reaper — keeps containers for 5 min of inactivity. Matches AWS production default. |
+| `FLOCI_SERVICES_LAMBDA_EPHEMERAL` | `false` | Warm pool enabled. Set `true` in CI or for guaranteed fresh code per invoke. |
+
+**Hard-coded Floci timeouts we can't configure:**
+- 5-min image pull timeout on first Lambda runtime image pull
+- +2s grace on top of function timeout
+- 30s Runtime API long-poll
+
+---
+
+## References
+
+### Direct documentation
+- Floci repo (canonical): https://github.com/floci-io/floci
+- Floci docs site: https://floci.io/floci/
+- Floci Lambda service: https://floci.io/floci/services/lambda/
+- Floci application.yml reference: https://floci.io/floci/configuration/application-yml/
+- LocalStack (for comparison): https://docs.localstack.cloud/user-guide/aws/lambda/
+- Serverless Python Requirements (pattern we mirror for Docker pip): https://www.serverless.com/plugins/serverless-python-requirements
+
+### Educational videos (referenced for architecture decisions)
+The original Floci integration was informed by these LocalStack videos — patterns like containerized dep builds, hot reloading, SNS→Lambda testing, and debugger attach were extracted and adapted for Floci. Verbatim transcripts not available (YouTube blocks page-body fetch), but video titles + our extracted patterns are documented in the `reference_localstack_youtube_learnings.md` memory.
+
+- "How to hot reload your Lambda functions locally with LocalStack" — https://youtu.be/BKjPOhQE2hg
+  - We borrowed: the idea of matching Lambda runtime for builds, Docker socket mounting pattern.
+- "TestMu AI-LocalStack Integration" — https://youtu.be/DFS3CnB-Z0k
+  - We borrowed: `AWS_ENDPOINT_URL=http://floci:4566` env pattern.
+- "How to test AWS Lambda, SNS using localstack" — https://youtu.be/uLt5Ah1bUUk
+  - Future borrow: SNS→Lambda integration test patterns.
+- "Smarter Serverless Dev with LocalStack VS Code Toolkit & Lambda Debugging" — https://youtu.be/51EAwBDdgio
+  - Future borrow: VS Code extension + debugger attach patterns (not yet implemented).
+
+### Internal memory references
+- `reference_floci_complete.md` — full Floci env var / internals / gotchas reference
+- `reference_localstack_youtube_learnings.md` — patterns from videos, what we can port
+- `feedback_lambda_native_deps_arch.md` — why we build deps in Docker with matching arch
+- `feedback_local_testing_deploy_name_mismatch.md` — dir-name-verbatim contract
+- `feedback_loud_passfail_banners.md` — UI pass/fail banner pattern
+- `reference_floci_diagnostics.md` — quick debugging commands

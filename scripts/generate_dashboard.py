@@ -988,7 +988,8 @@ def build_html(
       </div>
       <div style="display:flex;gap:8px;margin-bottom:16px">
         <button id="lt-deploy-btn" onclick="ltDeploy()" style="flex:1;padding:10px;background:var(--blue);color:white;border:none;border-radius:var(--radius-sm);cursor:pointer;font-weight:600">1. Build &amp; Deploy</button>
-        <button id="lt-invoke-btn" onclick="ltInvoke()" disabled style="flex:1;padding:10px;background:var(--green);color:white;border:none;border-radius:var(--radius-sm);cursor:pointer;font-weight:600;opacity:.5">2. Invoke</button>
+        <button id="lt-seed-btn" onclick="ltSeed()" disabled style="flex:1;padding:10px;background:var(--orange,#f59e0b);color:white;border:none;border-radius:var(--radius-sm);cursor:pointer;font-weight:600;opacity:.5" title="Create S3 buckets, SQS queues, DDB tables the Lambda expects. Idempotent.">2. Seed Resources</button>
+        <button id="lt-invoke-btn" onclick="ltInvoke()" disabled style="flex:1;padding:10px;background:var(--green);color:white;border:none;border-radius:var(--radius-sm);cursor:pointer;font-weight:600;opacity:.5">3. Invoke</button>
       </div>
       <div id="lt-status" style="padding:10px;background:var(--bg-primary);border:1px solid var(--border);border-radius:var(--radius-sm);font-family:monospace;font-size:12px;color:var(--text-secondary);min-height:80px;max-height:300px;overflow:auto;white-space:pre-wrap">Ready.</div>
     </div>
@@ -1610,6 +1611,8 @@ async function ltOpen(dirName) {{
   const displayName = 'local-' + dirName.replace(/_/g, '-');
   document.getElementById('lt-fn').textContent = displayName;
   document.getElementById('lt-status').textContent = 'Loading test events...';
+  document.getElementById('lt-seed-btn').disabled = true;
+  document.getElementById('lt-seed-btn').style.opacity = '.5';
   document.getElementById('lt-invoke-btn').disabled = true;
   document.getElementById('lt-invoke-btn').style.opacity = '.5';
   document.getElementById('lt-modal').style.display = 'flex';
@@ -1648,7 +1651,9 @@ async function ltPollJob(jobId) {{
   const start = Date.now();
   let seenLogs = 0;
   let lastData = null;
-  for (let i = 0; i < 300; i++) {{
+  // 900 iterations × 1s = 15 min. Large TypeScript repos (pdf_compressor has
+  // 300MB node_modules, 28K files) take 3-5 min just to zip on cold cache.
+  for (let i = 0; i < 900; i++) {{
     await new Promise(r => setTimeout(r, 1000));
     const res = await fetch(`${{WIZARD_BASE}}/api/lambda/job/${{jobId}}`);
     const data = await res.json();
@@ -1680,7 +1685,7 @@ async function ltPollJob(jobId) {{
       return data;
     }}
   }}
-  throw new Error('Timeout waiting for job (5 min)');
+  throw new Error('Timeout waiting for job (15 min)');
 }}
 
 // NOTE: ltCurrentFn stores the raw directory name (matches disk, from r.functionName).
@@ -1707,9 +1712,11 @@ async function ltDeploy() {{
     ltAppend(`[deploy] ✓ finished: ${{job.status}}`);
     const bar = '═'.repeat(60);
     if (job.status === 'done') {{
+      document.getElementById('lt-seed-btn').disabled = false;
+      document.getElementById('lt-seed-btn').style.opacity = '1';
       document.getElementById('lt-invoke-btn').disabled = false;
       document.getElementById('lt-invoke-btn').style.opacity = '1';
-      ltAppend(`\\n${{bar}}\\n✅ DEPLOY OK — ready to invoke\\n${{bar}}`);
+      ltAppend(`\\n${{bar}}\\n✅ DEPLOY OK — click "2. Seed Resources" to create buckets/queues, then "3. Invoke"\\n${{bar}}`);
     }} else {{
       const err = (job.result && job.result.error) || 'unknown error';
       ltAppend(`\\n${{bar}}\\n❌ DEPLOY FAILED — ${{err}}\\n${{bar}}`);
@@ -1718,6 +1725,44 @@ async function ltDeploy() {{
     ltAppend(`[deploy] EXCEPTION: ${{e.message}}`);
   }} finally {{
     document.getElementById('lt-deploy-btn').disabled = false;
+  }}
+}}
+
+async function ltSeed() {{
+  if (!ltCurrentFn) return;
+  const repoName = 'beaconstac_lambda_functions';
+  document.getElementById('lt-seed-btn').disabled = true;
+  ltAppend(`[seed] POST /api/lambda/seed  repo=${{repoName}}  function=${{ltCurrentFn}}`);
+  try {{
+    const res = await fetch(`${{WIZARD_BASE}}/api/lambda/seed`, {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ repo: repoName, function: ltCurrentFn }})
+    }});
+    const data = await res.json();
+    if (!data.job_id) {{ ltAppend(`[seed] ERROR: ${{JSON.stringify(data)}}`); document.getElementById('lt-seed-btn').disabled = false; return; }}
+    ltAppend(`[seed] job_id=${{data.job_id}}`);
+    const job = await ltPollJob(data.job_id);
+    ltAppend(`[seed] ✓ finished: ${{job.status}}`);
+    const bar = '═'.repeat(60);
+    if (job.status === 'done' && job.result && job.result.created) {{
+      const c = job.result.created;
+      const summary = [
+        c.s3_buckets.length ? `${{c.s3_buckets.length}} S3 bucket(s)` : null,
+        c.sqs_queues.length ? `${{c.sqs_queues.length}} SQS queue(s)` : null,
+        c.ddb_tables.length ? `${{c.ddb_tables.length}} DDB table(s)` : null,
+        c.ses_identities.length ? `${{c.ses_identities.length}} SES identit(ies)` : null,
+        c.fixtures_uploaded.length ? `${{c.fixtures_uploaded.length}} fixture(s)` : null,
+      ].filter(Boolean).join(', ') || 'no resources detected';
+      ltAppend(`\\n${{bar}}\\n✅ SEED OK — created: ${{summary}}\\n${{bar}}`);
+    }} else {{
+      const err = (job.result && job.result.error) || 'unknown error';
+      ltAppend(`\\n${{bar}}\\n❌ SEED FAILED — ${{err}}\\n${{bar}}`);
+    }}
+  }} catch (e) {{
+    ltAppend(`[seed] EXCEPTION: ${{e.message}}`);
+  }} finally {{
+    document.getElementById('lt-seed-btn').disabled = false;
   }}
 }}
 

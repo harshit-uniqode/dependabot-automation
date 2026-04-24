@@ -76,28 +76,50 @@ cp .env.example .env
 # edit .env if you want LLM-powered deep analysis or LocalStack Pro
 ```
 
-### 4. Start the wizard server
+### 4. Start everything with one command
 
 ```bash
-make wizard-server
+make restart
 ```
+
+This single command does a full clean restart:
+
+1. Kills any running wizard on :8787 and stops old emulators.
+2. Starts the Floci AWS emulator on :4566 and waits for health.
+3. Regenerates the Lambda and Angular dashboards from live alerts.
+4. Starts the wizard server in the background (log: `.uniqode/wizard.log`).
+5. Prints the dashboard URLs.
 
 You will see:
 
 ```
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- Upgrade Wizard Server
+ All services ready
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  Dashboard:  http://127.0.0.1:8787/
-  API:        http://127.0.0.1:8787/api/
+  Dashboards:
+    Lambda   http://127.0.0.1:8787/vulnerability-dashboards/lambda-dashboard.html
+    Angular  http://127.0.0.1:8787/vulnerability-dashboards/angular-dashboard.html
+  API:       http://127.0.0.1:8787/api/
+  Floci:     http://localhost:4566
 ```
+
+Variants when you don't need a full restart:
+
+| Command              | What it skips                   | When to use                          |
+| -------------------- | ------------------------------- | ------------------------------------ |
+| `make restart`       | —                               | Default. Clean slate every time.     |
+| `make restart-fast`  | Dashboard regen                 | You already ran `gh` today.          |
+| `make restart-wizard`| Emulator + dashboard regen      | Only the wizard is misbehaving.      |
+| `make stop-all`      | (shuts everything down)         | End of the workday.                  |
+
+Prefer the server in the foreground instead? Use `make wizard-server`.
 
 ---
 
 ## Running the dashboards
 
-1. `make wizard-server` — start the server (port 8787).
+1. `make restart` (or `make wizard-server` for foreground-only) — start the server on port 8787.
 2. Open one of the two dashboards in your browser:
 
    - **Angular Portal:** http://127.0.0.1:8787/vulnerability-dashboards/angular-dashboard.html
@@ -161,6 +183,8 @@ make refresh-lambda       # Re-open — row expansion shows "AI Safety Analysis"
 
 | Dashboard action            | CLI equivalent                                                         |
 | --------------------------- | ---------------------------------------------------------------------- |
+| Full clean restart          | `make restart` (wizard + Floci + dashboards, one command)              |
+| Stop everything             | `make stop-all`                                                        |
 | Start emulator              | `make emulator-up`                                                     |
 | Stop emulator               | `make emulator-down`                                                   |
 | Verify emulator resources   | `make verify-resources`                                                |

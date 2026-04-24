@@ -13,6 +13,11 @@ services:
       - "4566:4566"
     volumes:
       - "/var/run/docker.sock:/var/run/docker.sock"
+      # Persist Lambda code + S3 + DDB across restarts (hybrid storage mode).
+      # Without this, every `docker restart lambda-test-emulator` wipes all
+      # deployed functions and you must redeploy. See Floci storage docs:
+      # https://floci.io/floci/configuration/storage/
+      - "./data:/app/data"
     environment:
       - SERVICES=s3,sqs,dynamodb,lambda,sns,ses,apigateway,kms,cloudwatch
       - DEBUG=0
@@ -30,6 +35,14 @@ services:
       # If you rename the repo dir, regenerate with: docker network ls | grep default
       - FLOCI_SERVICES_LAMBDA_DOCKER_NETWORK=dependabotvulnerabilitytracker_default
       - FLOCI_HOSTNAME=floci
+      # ── Storage: hybrid = in-memory for speed + periodic flush to disk ──
+      # Lambda code, S3 objects, DDB tables persist across Floci restarts.
+      - FLOCI_STORAGE_MODE=hybrid
+      # ── Warm pool: keep containers alive between invocations for speed ──
+      # 300s idle = faster iteration during active testing. Set EPHEMERAL=true
+      # if you need guaranteed fresh code on every invoke (slower cold starts).
+      - FLOCI_SERVICES_LAMBDA_CONTAINER_IDLE_TIMEOUT_SECONDS=300
+      - FLOCI_SERVICES_LAMBDA_EPHEMERAL=false
     networks:
       default:
         aliases:

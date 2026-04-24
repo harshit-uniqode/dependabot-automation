@@ -15,6 +15,7 @@ import base64
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import threading
@@ -210,48 +211,127 @@ def list_events(project_root):
 # BUILD + ZIP
 # ─────────────────────────────────────────────────────────────
 
-def _zip_dir(src_dir, zip_path, extra_dirs=None):
-    """Create a zip of src_dir at zip_path. Merges extra_dirs on top."""
-    src = Path(src_dir)
+_ZIP_SKIP_DIRS = {
+    ".git", ".idea", ".vscode", "__pycache__", ".pytest_cache",
+    ".mypy_cache", ".ruff_cache", ".serverless", ".localtest_pkg",
+    "tests", "test", "coverage", ".nyc_output", ".DS_Store",
+}
+_ZIP_SKIP_FILE_SUFFIXES = {".zip", ".log", ".pyc", ".pyo", ".swp"}
+
+
+def _zip_dir(src_dir, zip_path, extra_dirs=None, jid=None):
+    """Create a zip of src_dir at zip_path. Merges extra_dirs on top.
+
+    CONTRACT: output zip_path MUST be excluded from the walk — critical when
+    zip_path is inside src_dir (we zip the fn dir, and zip output is typically
+    fn_dir/function.zip). Without this skip, the growing zip gets included in
+    itself → 100GB+ runaway zips (happened with pdf_compressor on 2026-04-24).
+    Also skip node_modules unless explicitly passed as extra_dir (so large
+    TypeScript repos don't double-zip their deps).
+    """
+    src = Path(src_dir).resolve()
+    zip_abs = Path(zip_path).resolve()
+
+    extra_abs_set = {Path(e).resolve() for e in (extra_dirs or [])}
+
+    def _should_skip_dir(path: Path) -> bool:
+        if path.name in _ZIP_SKIP_DIRS:
+            return True
+        # Skip node_modules in main walk unless it's been passed as an extra_dir
+        if path.name == "node_modules" and path.resolve() not in extra_abs_set:
+            return True
+        return False
+
+    files_written = 0
+    last_progress = time.time()
+
+    def _progress_tick(current_path):
+        nonlocal last_progress
+        now = time.time()
+        if jid and (now - last_progress) >= 2.0:
+            size_mb = zip_abs.stat().st_size / (1024 * 1024) if zip_abs.exists() else 0
+            _log(jid, f"  [zip] {files_written} files written, {size_mb:.1f} MB so far (current: {current_path.name})")
+            last_progress = now
+
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for root, _, files in os.walk(src):
+        for root, dirs, files in os.walk(src):
+            dirs[:] = [d for d in dirs if not _should_skip_dir(Path(root) / d)]
             for fname in files:
                 abs_path = Path(root) / fname
+                if abs_path.resolve() == zip_abs:
+                    continue
+                if abs_path.suffix in _ZIP_SKIP_FILE_SUFFIXES:
+                    continue
                 rel = abs_path.relative_to(src)
                 zf.write(abs_path, rel.as_posix())
+                files_written += 1
+                _progress_tick(abs_path)
         for extra in extra_dirs or []:
             ex = Path(extra)
             if not ex.exists():
                 continue
             base = ex.parent
-            for root, _, files in os.walk(ex):
+            for root, dirs, files in os.walk(ex):
+                dirs[:] = [d for d in dirs if d not in _ZIP_SKIP_DIRS]
                 for fname in files:
                     abs_path = Path(root) / fname
+                    if abs_path.resolve() == zip_abs:
+                        continue
+                    if abs_path.suffix in _ZIP_SKIP_FILE_SUFFIXES:
+                        continue
                     rel = abs_path.relative_to(base)
                     zf.write(abs_path, rel.as_posix())
+                    files_written += 1
+                    _progress_tick(abs_path)
+
+    if jid:
+        final_size_mb = zip_abs.stat().st_size / (1024 * 1024) if zip_abs.exists() else 0
+        _log(jid, f"  [zip] ✓ wrote {files_written} files, final size {final_size_mb:.1f} MB")
 
 
 def _build_node(fn_dir, jid):
-    """npm install + compile if tsc config / compile script present."""
+    """npm install + compile TypeScript if needed.
+
+    Compile priority (first match wins):
+      1. `npm run compile` if that script exists
+      2. `npm run build` if that script exists
+      3. `npx tsc` if tsconfig.json exists (even without a script)
+
+    Reason for #3: some Lambdas (e.g. pdf_compressor) have a tsconfig with
+    `outDir: dist` but no npm script. Real prod deploy uses serverless + TS
+    plugin which auto-compiles. We replicate that here so handler `dist/index.X`
+    actually resolves.
+    """
     rc, _, _ = _run(["npm", "install", "--no-audit", "--no-fund"], cwd=fn_dir, timeout=300, jid=jid)
     if rc != 0:
         return False, "npm install failed"
 
     pkg = Path(fn_dir) / "package.json"
+    compiled = False
     if pkg.exists():
         try:
             data = json.loads(pkg.read_text())
             scripts = data.get("scripts", {})
             if "compile" in scripts:
-                rc, _, _ = _run(["npm", "run", "compile"], cwd=fn_dir, timeout=180, jid=jid)
+                rc, _, _ = _run(["npm", "run", "compile"], cwd=fn_dir, timeout=300, jid=jid)
                 if rc != 0:
                     return False, "npm run compile failed"
+                compiled = True
             elif "build" in scripts:
-                rc, _, _ = _run(["npm", "run", "build"], cwd=fn_dir, timeout=180, jid=jid)
+                rc, _, _ = _run(["npm", "run", "build"], cwd=fn_dir, timeout=300, jid=jid)
                 if rc != 0:
                     return False, "npm run build failed"
+                compiled = True
         except (json.JSONDecodeError, OSError):
             pass
+
+    # Fallback: if we have tsconfig.json but no compile script ran, try npx tsc.
+    if not compiled and (Path(fn_dir) / "tsconfig.json").exists():
+        _log(jid, "tsconfig.json present but no compile/build script — running `npx tsc`")
+        rc, _, _ = _run(["npx", "tsc"], cwd=fn_dir, timeout=300, jid=jid)
+        if rc != 0:
+            return False, "npx tsc failed"
+
     return True, "ok"
 
 
@@ -327,7 +407,7 @@ def build_zip(fn_dir, language, jid, runtime="python3.9"):
         if nm.exists():
             extras.append(str(nm))
         _log(jid, f"Zipping {src_root} (+node_modules) → {zip_path}")
-        _zip_dir(src_root, zip_path, extra_dirs=extras)
+        _zip_dir(src_root, zip_path, extra_dirs=extras, jid=jid)
         # Handler path adjustment: if we zipped dist/ contents at root,
         # strip leading "dist/" from handler so it resolves.
         if dist.exists() and src_root == dist:
@@ -339,7 +419,7 @@ def build_zip(fn_dir, language, jid, runtime="python3.9"):
         if not ok:
             return False, pkg_dir
         _log(jid, f"Zipping {pkg_dir} → {zip_path}")
-        _zip_dir(pkg_dir, zip_path)
+        _zip_dir(pkg_dir, zip_path, jid=jid)
         return True, {"zip": str(zip_path)}
 
     return False, f"unsupported language: {language}"
@@ -348,6 +428,44 @@ def build_zip(fn_dir, language, jid, runtime="python3.9"):
 # ─────────────────────────────────────────────────────────────
 # DEPLOY + INVOKE
 # ─────────────────────────────────────────────────────────────
+
+def _load_env_vars(project_root, fn_name):
+    """Load config/lambda-env-vars.json and return merged env dict.
+
+    Merge order (later wins):
+      1. Parameters block  — global defaults for all functions
+      2. <fn_name> block   — per-function overrides keyed by Lambda dir name
+      3. Hardcoded infra   — AWS creds/endpoint/stage always applied last
+
+    fn_name is the raw directory name (e.g. "beaconstac_pdf_compressor").
+    """
+    env_file = Path(project_root) / "config" / "lambda-env-vars.json"
+    merged = {}
+    if env_file.exists():
+        try:
+            data = json.loads(env_file.read_text())
+            merged.update(data.get("Parameters", {}))
+            merged.update(data.get(fn_name, {}))
+        except (json.JSONDecodeError, OSError):
+            pass
+    # Infra vars always win — Lambda must reach Floci endpoint
+    merged.update({
+        "AWS_ACCESS_KEY_ID": "test",
+        "AWS_SECRET_ACCESS_KEY": "test",
+        "AWS_DEFAULT_REGION": "us-east-1",
+        "AWS_REGION": "us-east-1",
+        "AWS_ENDPOINT_URL": "http://floci:4566",
+        "STAGE": "local",
+        "NODE_OPTIONS": "--no-deprecation",
+    })
+    return merged
+
+
+def _env_vars_str(env_dict):
+    """Serialize env dict to AWS CLI --environment Variables={K=V,...} format."""
+    pairs = ",".join(f"{k}={v}" for k, v in env_dict.items())
+    return f"Variables={{{pairs}}}"
+
 
 def _awslocal_or_aws():
     """Prefer awslocal; fallback to aws with --endpoint-url."""
@@ -400,42 +518,84 @@ def deploy(fn_meta, project_root):
             handler = handler[len(prefix_strip):]
             _log(jid, f"Handler adjusted: {original_handler} → {handler} (zip root is {prefix_strip.rstrip('/')}/)")
 
+        # ── Upload path decision: inline vs S3 ──────────────────────
+        # AWS Lambda CreateFunction has a 50MB limit on inline zip upload
+        # (raw bytes via --zip-file), and Floci reports a 100MB JSON string
+        # limit for the base64-encoded body. For large zips we upload to
+        # Floci's S3 first and reference via Code.S3Bucket/S3Key.
+        # Threshold: 50MB raw zip → safe headroom below all limits.
+        zip_size = os.path.getsize(zip_path)
+        zip_size_mb = zip_size / (1024 * 1024)
+        USE_S3_THRESHOLD = 50 * 1024 * 1024  # 50 MB
+
+        code_ref = None  # either ("inline",) or ("s3", bucket, key)
+        if zip_size > USE_S3_THRESHOLD:
+            s3_bucket = "floci-lambda-code"
+            s3_key = f"{fn_name}-{int(time.time())}.zip"
+            _log(jid, f"Zip is {zip_size_mb:.1f} MB — using S3 upload path (bucket={s3_bucket}, key={s3_key})")
+
+            # Create bucket (idempotent — ignore BucketAlreadyOwnedByYou)
+            _run(cli + ["s3api", "create-bucket", "--bucket", s3_bucket],
+                 timeout=30, jid=jid)
+
+            # Upload zip
+            rc, _, stderr = _run(
+                cli + ["s3", "cp", zip_path, f"s3://{s3_bucket}/{s3_key}"],
+                timeout=600, jid=jid,
+            )
+            if rc != 0:
+                _finish(jid, "error", {"error": f"s3 upload failed: {stderr[:500]}"})
+                return
+            code_ref = ("s3", s3_bucket, s3_key)
+        else:
+            _log(jid, f"Zip is {zip_size_mb:.1f} MB — using inline upload")
+            code_ref = ("inline",)
+
+        env_dict = _load_env_vars(project_root, fn_meta["name"])
+        env_vars_str = _env_vars_str(env_dict)
+        _log(jid, f"Env vars: {list(env_dict.keys())}")
         _log(jid, f"Deploying {fn_name} (runtime={runtime}, handler={handler})...")
 
         # Try update first; fallback to create
+        if code_ref[0] == "s3":
+            update_args = ["--s3-bucket", code_ref[1], "--s3-key", code_ref[2]]
+        else:
+            update_args = ["--zip-file", f"fileb://{zip_path}"]
+
         rc, _, stderr = _run(
             cli + ["lambda", "update-function-code",
-                   "--function-name", fn_name,
-                   "--zip-file", f"fileb://{zip_path}"],
-            timeout=60, jid=jid,
+                   "--function-name", fn_name] + update_args,
+            timeout=120, jid=jid,
         )
-        if rc != 0:
-            _log(jid, "Function does not exist yet, creating...")
-            # Pass dummy AWS creds + endpoint so handlers that use aws-sdk
-            # can find credentials inside the Lambda container. Floci proxies
-            # AWS calls made to http://floci:4566 back to its own services.
-            env_vars = (
-                "Variables={"
-                "AWS_ACCESS_KEY_ID=test,"
-                "AWS_SECRET_ACCESS_KEY=test,"
-                "AWS_DEFAULT_REGION=us-east-1,"
-                "AWS_REGION=us-east-1,"
-                "AWS_ENDPOINT_URL=http://floci:4566,"
-                "STAGE=local,"
-                "NODE_OPTIONS=--no-deprecation"
-                "}"
+        if rc == 0:
+            # Function existed — also refresh env vars so any changes in
+            # lambda-env-vars.json take effect (update-function-code does not touch env)
+            _log(jid, "Function updated — refreshing env vars...")
+            _run(
+                cli + ["lambda", "update-function-configuration",
+                       "--function-name", fn_name,
+                       "--environment", env_vars_str],
+                timeout=60, jid=jid,
             )
+        else:
+            _log(jid, "Function does not exist yet, creating...")
+            # Code arg differs by path
+            if code_ref[0] == "s3":
+                code_args = ["--code", f"S3Bucket={code_ref[1]},S3Key={code_ref[2]}"]
+            else:
+                code_args = ["--zip-file", f"fileb://{zip_path}"]
+
             rc, _, stderr = _run(
                 cli + ["lambda", "create-function",
                        "--function-name", fn_name,
                        "--runtime", runtime,
                        "--handler", handler,
-                       "--role", "arn:aws:iam::000000000000:role/lambda-role",
-                       "--zip-file", f"fileb://{zip_path}",
-                       "--timeout", str(fn_meta.get("timeout", 60)),
+                       "--role", "arn:aws:iam::000000000000:role/lambda-role"] +
+                code_args +
+                      ["--timeout", str(fn_meta.get("timeout", 60)),
                        "--memory-size", str(fn_meta.get("memory", 256)),
-                       "--environment", env_vars],
-                timeout=120, jid=jid,
+                       "--environment", env_vars_str],
+                timeout=300, jid=jid,
             )
             if rc != 0:
                 _finish(jid, "error", {"error": f"create-function failed: {stderr[:500]}"})
@@ -453,6 +613,167 @@ def deploy(fn_meta, project_root):
             "handler": handler,
             "zip_size_bytes": os.path.getsize(zip_path),
         })
+
+    threading.Thread(target=_task, daemon=True).start()
+    return jid
+
+
+# ─────────────────────────────────────────────────────────────
+# SEED — auto-create AWS resources the Lambda expects
+# ─────────────────────────────────────────────────────────────
+
+def _detect_resources(fn_meta):
+    """Parse serverless.yml + handler source to infer AWS resources needed.
+
+    Returns dict with keys:
+      s3_buckets   — list of bucket names
+      sqs_queues   — list of queue names
+      ddb_tables   — list of table names
+      ses_identities — list of email addresses to verify
+    """
+    resources = {"s3_buckets": set(), "sqs_queues": set(), "ddb_tables": set(), "ses_identities": set()}
+    fn_dir = Path(fn_meta["path"])
+
+    # 1. serverless.yml parse
+    sls_yml = fn_dir / "serverless.yml"
+    if sls_yml.exists():
+        try:
+            txt = sls_yml.read_text()
+            # Extract env vars like S3_BUCKET: <value>
+            for m in re.finditer(r"(\w+_BUCKET|S3_BUCKET|BUCKET_NAME):\s*([^\s#]+)", txt):
+                val = m.group(2).strip()
+                # Skip template vars like ${param:s3Bucket}
+                if not val.startswith("$"):
+                    resources["s3_buckets"].add(val)
+            # SQS queue resource refs: QueueName: foo
+            for m in re.finditer(r"QueueName:\s*([^\s#]+)", txt):
+                val = m.group(1).strip()
+                if not val.startswith("$"):
+                    resources["sqs_queues"].add(val)
+            # DDB table resource refs: TableName: foo
+            for m in re.finditer(r"TableName:\s*([^\s#]+)", txt):
+                val = m.group(1).strip()
+                if not val.startswith("$"):
+                    resources["ddb_tables"].add(val)
+        except OSError:
+            pass
+
+    # 2. Handler source scan — look for hardcoded defaults in code
+    #    Pattern: process.env.X_BUCKET ? ... : 'literal-bucket-name'
+    for src_dir in [fn_dir / "src", fn_dir]:
+        if not src_dir.is_dir():
+            continue
+        for f in src_dir.rglob("*.ts"):
+            if "node_modules" in str(f):
+                continue
+            try:
+                txt = f.read_text(errors="ignore")
+                # BUCKET fallback literals: 'beaconstac-content-debug'
+                for m in re.finditer(r"process\.env\.\w*BUCKET\w*\s*\?\s*[^:]+:\s*['\"]([^'\"]+)['\"]", txt):
+                    resources["s3_buckets"].add(m.group(1))
+                # Direct S3 bucket literals passed to .getObject({ Bucket: 'x' }...)
+                for m in re.finditer(r"Bucket:\s*['\"]([^'\"${}]+)['\"]", txt):
+                    resources["s3_buckets"].add(m.group(1))
+                # Direct ses sender identity: ses.sendEmail({ Source: 'a@b.com' })
+                for m in re.finditer(r"(?:Source|From):\s*['\"]([^'\"]+@[^'\"]+)['\"]", txt):
+                    resources["ses_identities"].add(m.group(1))
+            except (UnicodeDecodeError, OSError):
+                pass
+        for f in src_dir.rglob("*.py"):
+            try:
+                txt = f.read_text(errors="ignore")
+                for m in re.finditer(r"os\.environ\.get\(['\"]\w*BUCKET\w*['\"],\s*['\"]([^'\"]+)['\"]\)", txt):
+                    resources["s3_buckets"].add(m.group(1))
+                for m in re.finditer(r"Bucket=['\"]([^'\"${}]+)['\"]", txt):
+                    resources["s3_buckets"].add(m.group(1))
+            except (UnicodeDecodeError, OSError):
+                pass
+
+    # Convert sets to sorted lists for deterministic output
+    return {k: sorted(v) for k, v in resources.items()}
+
+
+def seed(fn_meta, project_root):
+    """Create AWS resources detected from the Lambda's serverless.yml + source.
+
+    Idempotent: create-bucket / create-queue return errors on duplicates, we ignore.
+    Also uploads any fixtures found at <fn_dir>/tests/fixtures/* to the first
+    detected S3 bucket under the same filename.
+    """
+    jid = _new_job()
+
+    def _task():
+        cli = _awslocal_or_aws()
+        if not cli:
+            _finish(jid, "error", {"error": "Neither awslocal nor aws CLI found."})
+            return
+
+        resources = _detect_resources(fn_meta)
+        _log(jid, f"Detected resources: {json.dumps(resources)}")
+
+        created = {"s3_buckets": [], "sqs_queues": [], "ddb_tables": [], "ses_identities": [], "fixtures_uploaded": []}
+
+        # S3 buckets
+        for bucket in resources["s3_buckets"]:
+            _log(jid, f"Creating S3 bucket: {bucket}")
+            rc, _, stderr = _run(
+                cli + ["s3api", "create-bucket", "--bucket", bucket],
+                timeout=30, jid=jid,
+            )
+            if rc == 0 or "BucketAlreadyOwnedByYou" in stderr:
+                created["s3_buckets"].append(bucket)
+
+        # SQS queues
+        for queue in resources["sqs_queues"]:
+            _log(jid, f"Creating SQS queue: {queue}")
+            rc, _, stderr = _run(
+                cli + ["sqs", "create-queue", "--queue-name", queue],
+                timeout=30, jid=jid,
+            )
+            if rc == 0 or "QueueAlreadyExists" in stderr:
+                created["sqs_queues"].append(queue)
+
+        # DDB tables — minimal schema (primary key=id)
+        for table in resources["ddb_tables"]:
+            _log(jid, f"Creating DDB table: {table} (schema=id:S)")
+            rc, _, stderr = _run(
+                cli + ["dynamodb", "create-table",
+                       "--table-name", table,
+                       "--attribute-definitions", "AttributeName=id,AttributeType=S",
+                       "--key-schema", "AttributeName=id,KeyType=HASH",
+                       "--billing-mode", "PAY_PER_REQUEST"],
+                timeout=30, jid=jid,
+            )
+            if rc == 0 or "ResourceInUseException" in stderr:
+                created["ddb_tables"].append(table)
+
+        # SES identities
+        for email in resources["ses_identities"]:
+            _log(jid, f"Verifying SES identity: {email}")
+            rc, _, _ = _run(
+                cli + ["ses", "verify-email-identity", "--email-address", email],
+                timeout=30, jid=jid,
+            )
+            if rc == 0:
+                created["ses_identities"].append(email)
+
+        # Upload fixtures (if any) to first detected S3 bucket
+        fn_dir = Path(fn_meta["path"])
+        fixtures_dir = fn_dir / "tests" / "fixtures"
+        if fixtures_dir.is_dir() and created["s3_buckets"]:
+            target_bucket = created["s3_buckets"][0]
+            for f in fixtures_dir.iterdir():
+                if not f.is_file():
+                    continue
+                _log(jid, f"Uploading fixture: {f.name} → s3://{target_bucket}/{f.name}")
+                rc, _, _ = _run(
+                    cli + ["s3", "cp", str(f), f"s3://{target_bucket}/{f.name}"],
+                    timeout=60, jid=jid,
+                )
+                if rc == 0:
+                    created["fixtures_uploaded"].append(f"s3://{target_bucket}/{f.name}")
+
+        _finish(jid, "done", {"created": created})
 
     threading.Thread(target=_task, daemon=True).start()
     return jid

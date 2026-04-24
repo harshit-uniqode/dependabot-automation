@@ -22,4 +22,5 @@ vulnerability-dashboards/.deep-analysis-cache.json
 .localtest_pkg/
 function.zip
 localstack-data/
+docker/data/
 vulnerability-dashboards/.alert-snapshot-*.json

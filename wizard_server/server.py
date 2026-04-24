@@ -123,6 +123,8 @@ class WizardHandler(SimpleHTTPRequestHandler):
             self._json_response(202, {"job_id": jid, "status": "stopping"})
         elif path == "/api/lambda/deploy":
             self._handle_lambda_deploy(body or {})
+        elif path == "/api/lambda/seed":
+            self._handle_lambda_seed(body or {})
         elif path == "/api/lambda/invoke":
             self._handle_lambda_invoke(body or {})
         else:
@@ -253,6 +255,19 @@ class WizardHandler(SimpleHTTPRequestHandler):
             return
         jid = lambda_tester.deploy(fn_meta, str(_project_root))
         self._json_response(202, {"job_id": jid, "status": "deploying"})
+
+    def _handle_lambda_seed(self, body):
+        repo_name = body.get("repo")
+        fn_name = body.get("function")
+        if not repo_name or not fn_name:
+            self._json_response(400, {"error": "repo and function required"})
+            return
+        fn_meta = lambda_tester.find_function(_repos_info, repo_name, fn_name)
+        if not fn_meta:
+            self._json_response(404, {"error": f"function not found: {repo_name}/{fn_name}"})
+            return
+        jid = lambda_tester.seed(fn_meta, str(_project_root))
+        self._json_response(202, {"job_id": jid, "status": "seeding"})
 
     def _handle_lambda_invoke(self, body):
         repo_name = body.get("repo")
