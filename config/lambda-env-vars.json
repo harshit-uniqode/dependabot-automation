@@ -5,6 +5,10 @@
     "AWS_DEFAULT_REGION": "us-east-1",
     "AWS_ENDPOINT_URL": "http://host.docker.internal:4566"
   },
+  "beaconstac_pdf_compressor": {
+    "S3_BUCKET": "beaconstac-pdf-compressor-local",
+    "BEACONSTAC_API_KEY": "test"
+  },
   "MyFunction": {
     "AWS_ACCESS_KEY_ID": "test",
     "AWS_SECRET_ACCESS_KEY": "test",
