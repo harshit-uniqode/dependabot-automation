@@ -65,6 +65,13 @@ refresh-lambda:
 refresh-angular:
 	@./scripts/refresh-angular-dashboard.sh
 
+# ── Lambda UI flow docs (for the Local Testing modal) ──────────────
+sync-ui-flows:
+	@python3 scripts/sync_lambda_ui_flows.py
+
+sync-ui-flows-dry:
+	@python3 scripts/sync_lambda_ui_flows.py --dry-run
+
 # ── Emulator lifecycle ──────────────────────────────────────────────
 
 emulator-up:
@@ -189,6 +196,7 @@ depcheck:
 
 .PHONY: restart restart-fast restart-wizard stop-all \
         wizard-server refresh-lambda refresh-angular \
+        sync-ui-flows sync-ui-flows-dry \
         emulator-up emulator-up-localstack emulator-down emulator-logs emulator-health \
         setup-resources teardown-resources verify-resources \
         lambda-deploy lambda-invoke lambda-list lambda-logs lambda-clean \

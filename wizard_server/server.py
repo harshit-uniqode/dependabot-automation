@@ -87,6 +87,13 @@ class WizardHandler(SimpleHTTPRequestHandler):
             self._json_response(200, {"repos": lambda_tester.list_functions(_repos_info)})
         elif path == "/api/lambda/events":
             self._json_response(200, {"events": lambda_tester.list_events(_project_root)})
+        elif path.startswith("/api/lambda/ui-flow/"):
+            fn_dir = path.split("/api/lambda/ui-flow/")[-1]
+            # Reject path traversal at the boundary
+            if "/" in fn_dir or "\\" in fn_dir or fn_dir.startswith("."):
+                self._json_response(400, {"error": "invalid function name"})
+                return
+            self._handle_get_ui_flow(fn_dir)
         elif path.startswith("/api/lambda/job/"):
             jid = path.split("/api/lambda/job/")[-1]
             job = lambda_tester.get_job(jid)
@@ -229,6 +236,27 @@ class WizardHandler(SimpleHTTPRequestHandler):
         from . import api
         result = api.handle_test_upgrade(body, _repos_info, _config, _job_queue)
         self._json_response(result.pop("_status", 202), result)
+
+    # ── API: UI Flow ─────────────────────────────────────────
+
+    def _handle_get_ui_flow(self, fn_dir):
+        """Serve probable UI flow for a Lambda from config/lambda-ui-flows.json."""
+        flows_file = _project_root / "config" / "lambda-ui-flows.json"
+        if not flows_file.is_file():
+            self._json_response(404, {"error": "lambda-ui-flows.json not found"})
+            return
+        try:
+            data = json.loads(flows_file.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            self._json_response(500, {"error": f"failed to read flows: {e}"})
+            return
+        flow = data.get(fn_dir)
+        if not flow:
+            self._json_response(404, {
+                "error": f"No UI flow documented for '{fn_dir}'. Run: make sync-ui-flows"
+            })
+            return
+        self._json_response(200, {"function": fn_dir, "flow": flow})
 
     # ── API: Status ──────────────────────────────────────────
 

@@ -1,0 +1,642 @@
+{
+  "_meta": {
+    "purpose": "Human-friendly probable UI flow per Lambda — derived from handler source + serverless.yml triggers. For non-tech folks to spot-check on the actual product UI.",
+    "format": {
+      "what_it_does": "One sentence — what does this Lambda do?",
+      "trigger": "What kicks it off in the real world (user action / scheduled / queue message).",
+      "ui_flow": "Step-by-step from a user's POV. Where to click in Uniqode/Polo to make this Lambda run.",
+      "how_to_verify": "What to look at on the UI to confirm it worked — e.g. 'check the connected sheet for a new row'.",
+      "external_systems": "Third-party APIs the Lambda calls — these are NOT tested by Floci; require staging.",
+      "floci_tested": "What Floci actually verifies (import safety, event parse, AWS calls).",
+      "_note": "Flows are PROBABLE based on code reading. Cross-check with PM if unsure."
+    }
+  },
+
+  "forms-response-sync-service": {
+    "what_it_does": "Pushes a form response into the user's connected Google Sheet (or Microsoft Excel) row by row. Adds new columns automatically when a form gets new fields. Re-tries on Google API failures, gives up after 3 tries.",
+    "trigger": "Someone submits a form on a Uniqode form page.",
+    "ui_flow": [
+      "1. In Uniqode dashboard → Forms → pick a form → Integrations tab → connect Google Sheets (one-time OAuth).",
+      "2. Note the spreadsheet that was connected.",
+      "3. Open the public form URL → fill it in → submit.",
+      "4. Wait ~5 seconds.",
+      "5. Open the connected Google Sheet."
+    ],
+    "how_to_verify": [
+      "A new row appears at the bottom of the sheet with the answers you just submitted.",
+      "Column headers match the form fields (Name, Email, etc).",
+      "If you added a new field to the form after connecting, a NEW column should auto-appear in the sheet.",
+      "Submit again → second row appears below the first."
+    ],
+    "external_systems": ["Google Sheets API", "Google Drive API", "Django backend (for OAuth tokens)"],
+    "floci_tested": "Lambda boots, parses the SQS message, can talk to AWS SQS for retries. The actual Google sync is NOT tested locally."
+  },
+
+  "beaconstac_email_service": {
+    "what_it_does": "Sends transactional emails (signup confirmation, password reset, alert notifications, etc.) via AWS SES.",
+    "trigger": "Backend pushes a message to SQS when an email needs to go out.",
+    "ui_flow": [
+      "1. Trigger any email-sending action — sign up a new user, click 'Forgot password', share a QR code via email, etc.",
+      "2. Wait ~10 seconds."
+    ],
+    "how_to_verify": [
+      "Check the inbox of the recipient — email should arrive.",
+      "Check the email template renders correctly (logo, colors, links work).",
+      "If using AWS SES sandbox, sender/recipient must both be verified."
+    ],
+    "external_systems": ["AWS SES (for actual email delivery)"],
+    "floci_tested": "Boot + SQS event parse + SES API call (Floci has SES emulator — emails go to a fake mailbox, not real)."
+  },
+
+  "polo_email_service": {
+    "what_it_does": "Same as beaconstac_email_service but for The QR Code Generator (Polo) — separate stack, separate templates.",
+    "trigger": "Polo backend pushes a message to SQS for emails.",
+    "ui_flow": [
+      "1. Sign up on the-qrcode-generator.com or trigger any email action there.",
+      "2. Wait for delivery."
+    ],
+    "how_to_verify": [
+      "Email arrives in inbox.",
+      "Branding shows 'The QR Code Generator', not Uniqode."
+    ],
+    "external_systems": ["AWS SES"],
+    "floci_tested": "Same as email_service — boot + parse + SES emulator call."
+  },
+
+  "beaconstac_qr_code_generator": {
+    "what_it_does": "Generates a single QR code image (PNG/SVG/PDF) with the user's chosen design, logo, colors, frame.",
+    "trigger": "User downloads or previews a QR code from the dashboard.",
+    "ui_flow": [
+      "1. Uniqode dashboard → QR Codes → Create / Edit a QR.",
+      "2. Customize design (colors, logo, frame).",
+      "3. Click Download → choose format (PNG / SVG / PDF) → click Download."
+    ],
+    "how_to_verify": [
+      "QR image downloads in the chosen format.",
+      "Scan it with your phone camera → opens the destination URL.",
+      "Custom logo + colors render correctly."
+    ],
+    "external_systems": ["None (pure generator)"],
+    "floci_tested": "Boot + image generation logic + S3 upload to Floci's local S3."
+  },
+
+  "beaconstac_bulk_qr_generator": {
+    "what_it_does": "Generates many QR codes at once (e.g. 500 codes for a campaign) as a downloadable ZIP.",
+    "trigger": "User clicks 'Bulk Generate' in the dashboard with a CSV of destinations.",
+    "ui_flow": [
+      "1. Uniqode dashboard → QR Codes → Bulk Create.",
+      "2. Upload a CSV with one URL per row.",
+      "3. Pick design template.",
+      "4. Click Generate → wait (can take minutes for thousands of codes)."
+    ],
+    "how_to_verify": [
+      "Email arrives with a download link OR the dashboard shows the bulk job as 'Ready'.",
+      "Download the ZIP → contains one image per row of your CSV.",
+      "Pick 3 random codes → scan them → each opens its corresponding URL."
+    ],
+    "external_systems": ["AWS ECS (the bulk generation runs in a container, this Lambda just kicks it off)"],
+    "floci_tested": "Boot + ECS RunTask call (Floci does NOT emulate ECS — call will fail locally)."
+  },
+
+  "beaconstac_pdf_compressor": {
+    "what_it_does": "Compresses PDFs uploaded to forms (so they don't bloat S3 / cost bandwidth). Has a sister function `mergePDF` that combines multiple PDFs into one.",
+    "trigger": "User uploads a PDF as a form answer or attachment.",
+    "ui_flow": [
+      "1. Uniqode dashboard → Forms → form with a 'File Upload' field.",
+      "2. Open public form URL → upload a large PDF (>1MB) → submit.",
+      "3. Wait ~30 seconds."
+    ],
+    "how_to_verify": [
+      "Open form responses → click on the uploaded PDF → it downloads.",
+      "Downloaded PDF is significantly smaller than the original (e.g. 5MB → 1MB).",
+      "The PDF still opens correctly in any reader."
+    ],
+    "external_systems": ["None (Ghostscript runs inside the Lambda container)"],
+    "floci_tested": "Boot + S3 GetObject + Ghostscript exec + S3 PutObject (all on Floci's local S3)."
+  },
+
+  "uniqode-print-qr-codes-pdf": {
+    "what_it_does": "Generates a printable PDF sheet of QR codes (e.g. 4-up, 8-up, 16-up layouts) for users to print on Avery labels.",
+    "trigger": "User clicks 'Print Sheet' in the dashboard.",
+    "ui_flow": [
+      "1. Uniqode dashboard → QR Codes → select multiple QRs.",
+      "2. Click 'Print' or 'Export' → choose a label sheet template.",
+      "3. Click Generate."
+    ],
+    "how_to_verify": [
+      "PDF download starts within 30s.",
+      "PDF has correct number of QR codes per page.",
+      "Codes are sized to match a real Avery label sheet (print one to verify)."
+    ],
+    "external_systems": ["None"],
+    "floci_tested": "Boot + SQS parse + PDF generation + S3 upload (Floci-local)."
+  },
+
+  "beaconstac_image_optimizer": {
+    "what_it_does": "Resizes and compresses images uploaded by users (logos, profile pics, form attachments) to keep S3 storage low.",
+    "trigger": "User uploads any image to Uniqode.",
+    "ui_flow": [
+      "1. Uniqode dashboard → anywhere with an image upload (DBC profile pic, QR logo, link page background).",
+      "2. Upload a large image (>2MB).",
+      "3. Save."
+    ],
+    "how_to_verify": [
+      "Image renders correctly on the page.",
+      "Inspect via browser dev tools → image URL → download → file is much smaller than what you uploaded."
+    ],
+    "external_systems": ["None"],
+    "floci_tested": "Boot + S3 GetObject + image resize + S3 PutObject."
+  },
+
+  "beaconstac_profile_picture": {
+    "what_it_does": "Generates a default profile picture (avatar with initials) for new users who haven't uploaded one.",
+    "trigger": "Scheduled job (runs nightly to backfill missing avatars).",
+    "ui_flow": [
+      "1. Sign up a new user without uploading a profile picture.",
+      "2. Wait until the next scheduled run (or trigger manually if you have admin access)."
+    ],
+    "how_to_verify": [
+      "User profile shows an avatar with their initials in a colored circle.",
+      "S3 has a generated PNG at the user's avatar URL."
+    ],
+    "external_systems": ["None"],
+    "floci_tested": "Boot + S3 PutObject."
+  },
+
+  "beaconstac_svg_sanitizer": {
+    "what_it_does": "Strips dangerous content from user-uploaded SVG files (script tags, external image refs) before serving them. Security guard.",
+    "trigger": "User uploads an SVG (e.g. as a QR logo).",
+    "ui_flow": [
+      "1. Uniqode dashboard → QR design → Logo → Upload SVG.",
+      "2. Upload any SVG.",
+      "3. Save the QR."
+    ],
+    "how_to_verify": [
+      "SVG renders on the QR.",
+      "Open the served SVG URL → no `<script>` tags in source → no external `<image href>` refs."
+    ],
+    "external_systems": ["None"],
+    "floci_tested": "Boot + S3 GetObject + sanitize + S3 PutObject."
+  },
+
+  "beaconstac_malware_detection": {
+    "what_it_does": "Checks every URL behind a QR code against a malware/phishing database to block bad actors using Uniqode for scams.",
+    "trigger": "Scheduled (every few minutes) — scans recently-created QRs.",
+    "ui_flow": [
+      "1. Create a QR pointing to a known phishing URL (use a test URL from PhishTank or similar).",
+      "2. Wait ~10 minutes."
+    ],
+    "how_to_verify": [
+      "Dashboard shows the QR as 'Flagged' or disabled.",
+      "Scanning the QR shows a warning page instead of redirecting."
+    ],
+    "external_systems": ["Google Safe Browsing API or similar threat feed"],
+    "floci_tested": "Boot + scheduled trigger handling + DDB read/write."
+  },
+
+  "beaconstac_scheduler": {
+    "what_it_does": "Activates/deactivates scheduled QR codes — e.g. a QR set to 'live from Jan 1 to Mar 31' is enabled/disabled at the right time.",
+    "trigger": "Scheduled (runs every minute or so).",
+    "ui_flow": [
+      "1. Uniqode dashboard → create a QR with 'Schedule' enabled → set start date 2 minutes from now.",
+      "2. Save.",
+      "3. Wait until past the start time."
+    ],
+    "how_to_verify": [
+      "QR scan resolves successfully after the start time.",
+      "Before start time → scan shows 'not active' page."
+    ],
+    "external_systems": ["None"],
+    "floci_tested": "Boot + scheduled handler + DDB query."
+  },
+
+  "beaconstac_analytics": {
+    "what_it_does": "Sanitizes raw scan data before it lands in S3 for reporting (strips PII, normalizes timestamps).",
+    "trigger": "Kinesis Firehose stream — every QR scan generates a record.",
+    "ui_flow": [
+      "1. Scan any Uniqode QR code with your phone.",
+      "2. Wait 5-10 minutes."
+    ],
+    "how_to_verify": [
+      "Open the QR's Analytics tab → scan count incremented by 1.",
+      "Scan map shows your approximate location."
+    ],
+    "external_systems": ["None"],
+    "floci_tested": "Boot + Firehose record sanitization."
+  },
+
+  "beaconstac_analytics_data_stream_to_firehose": {
+    "what_it_does": "Pipes scan events into AWS Firehose for the analytics warehouse. Three variants: regular QR, link page, digital business card.",
+    "trigger": "DynamoDB stream (every scan writes a row, this Lambda fires on the change).",
+    "ui_flow": [
+      "1. Scan any QR / open any link page / view any DBC.",
+      "2. Wait."
+    ],
+    "how_to_verify": [
+      "Same as beaconstac_analytics — analytics dashboard count goes up."
+    ],
+    "external_systems": ["AWS Firehose → S3 → Redshift"],
+    "floci_tested": "Boot + DDB stream record parse + Firehose put."
+  },
+
+  "beaconstac_analytics_pdf_generator": {
+    "what_it_does": "Generates the downloadable PDF of an analytics report.",
+    "trigger": "User clicks 'Export PDF' in analytics view.",
+    "ui_flow": [
+      "1. Uniqode dashboard → Analytics → pick any QR with scans.",
+      "2. Click 'Export' → 'PDF'.",
+      "3. Wait."
+    ],
+    "how_to_verify": [
+      "PDF downloads.",
+      "Charts render correctly, colors match, scan counts match dashboard."
+    ],
+    "external_systems": ["None"],
+    "floci_tested": "Boot + SQS parse + chart rendering + S3 PutObject."
+  },
+
+  "beaconstac_analytics_validator": {
+    "what_it_does": "Internal QA tool — compares numbers between two analytics data sources to catch discrepancies in the warehouse.",
+    "trigger": "DynamoDB stream of analytics events.",
+    "ui_flow": ["Internal-only — not user-facing. Verify via internal dashboards / Datadog."],
+    "how_to_verify": ["Internal tooling check."],
+    "external_systems": ["Internal analytics services"],
+    "floci_tested": "Boot + DDB stream parse."
+  },
+
+  "beaconstac_azure_integration_tunnel": {
+    "what_it_does": "Routes Uniqode requests through to Azure Active Directory (SSO/SAML) for enterprise customers.",
+    "trigger": "User logs in with Azure SSO.",
+    "ui_flow": [
+      "1. Use a tenant configured for Azure SSO.",
+      "2. Click 'Sign in with Azure' on Uniqode login.",
+      "3. Complete Azure auth flow."
+    ],
+    "how_to_verify": [
+      "User lands in their Uniqode org dashboard.",
+      "Azure profile picture / name appears in account menu."
+    ],
+    "external_systems": ["Azure AD"],
+    "floci_tested": "Boot + HTTP event parse — actual Azure handshake NOT tested."
+  },
+
+  "beaconstac_cloudfront_invalidator": {
+    "what_it_does": "Tells CloudFront CDN to flush cached versions of files when a user updates them (so changes show up immediately).",
+    "trigger": "Backend SQS message after a file is updated.",
+    "ui_flow": [
+      "1. Update a QR design / link page background image.",
+      "2. Save.",
+      "3. Refresh the public scan/landing page."
+    ],
+    "how_to_verify": [
+      "Updated content appears immediately (not the cached old version).",
+      "If you see the old version → invalidation failed."
+    ],
+    "external_systems": ["AWS CloudFront API"],
+    "floci_tested": "Boot + SQS parse — CloudFront API call NOT in Floci."
+  },
+
+  "beaconstac_cloudfront_lambda@edge_handler": {
+    "what_it_does": "Runs at the CDN edge for every request — adds security headers, handles redirects, A/B test routing.",
+    "trigger": "Every CloudFront request (millions per day).",
+    "ui_flow": [
+      "1. Open any Uniqode public URL (scan a QR, view a link page).",
+      "2. Open browser dev tools → Network tab → click the request."
+    ],
+    "how_to_verify": [
+      "Response headers include security headers (CSP, X-Frame-Options, etc.).",
+      "Response time <100ms (edge function should be fast)."
+    ],
+    "external_systems": ["None"],
+    "floci_tested": "Boot — Lambda@Edge has special constraints (no env vars, etc.) Floci can't fully replicate."
+  },
+
+  "beaconstac_custom_domain_ssl_handler": {
+    "what_it_does": "Handles SSL certificate provisioning when a customer adds their own domain (qr.acme.com → Uniqode).",
+    "trigger": "Backend SQS message after customer adds a custom domain.",
+    "ui_flow": [
+      "1. Uniqode dashboard → Settings → Custom Domains.",
+      "2. Add a domain (e.g. qr.testdomain.com).",
+      "3. Add the CNAME record in your DNS provider.",
+      "4. Wait ~5-15 minutes for verification."
+    ],
+    "how_to_verify": [
+      "Dashboard shows the domain as 'Verified' / 'SSL Active'.",
+      "Visit https://yourdomain.com → shows valid SSL cert (no warning)."
+    ],
+    "external_systems": ["AWS ACM (cert provisioning)", "DNS lookups"],
+    "floci_tested": "Boot + SQS parse — ACM + DNS NOT tested."
+  },
+
+  "beaconstac_events_sender": {
+    "what_it_does": "Sends webhooks to customer-configured URLs when events happen (form submitted, QR scanned, etc.).",
+    "trigger": "Backend SQS message → first transformer reshapes data → sender Lambda fires the HTTP request.",
+    "ui_flow": [
+      "1. Uniqode dashboard → Settings → Webhooks → add a webhook URL (use webhook.site for testing).",
+      "2. Pick events (e.g. 'form.submitted').",
+      "3. Trigger the event (submit a form).",
+      "4. Wait ~5 seconds."
+    ],
+    "how_to_verify": [
+      "On webhook.site → request appears with the event payload.",
+      "HTTP 200 in dashboard's webhook delivery log."
+    ],
+    "external_systems": ["Customer's webhook URL (any HTTPS endpoint)"],
+    "floci_tested": "Boot + SQS parse + transform — actual HTTPS call NOT tested."
+  },
+
+  "beaconstac_intercom_rate_limiter": {
+    "what_it_does": "Throttles outgoing requests to Intercom (customer support tool) to avoid hitting their rate limits.",
+    "trigger": "Backend SQS message — every customer event that needs to sync to Intercom.",
+    "ui_flow": [
+      "1. Sign up a new user.",
+      "2. Trigger many events quickly (set their plan, update their org, etc.)."
+    ],
+    "how_to_verify": [
+      "User appears in Intercom with all property updates.",
+      "Even after many rapid changes, no rate-limit errors in logs."
+    ],
+    "external_systems": ["Intercom API"],
+    "floci_tested": "Boot + SQS parse + DDB rate-limit counter."
+  },
+
+  "beaconstac_intercom_rate_limiter_polo": {
+    "what_it_does": "Same as above but for The QR Code Generator (Polo) traffic to Intercom.",
+    "trigger": "Polo backend SQS message.",
+    "ui_flow": ["Same flow as Uniqode side, but on the-qrcode-generator.com signups."],
+    "how_to_verify": ["Same — Intercom shows the user, no rate-limit errors."],
+    "external_systems": ["Intercom API"],
+    "floci_tested": "Boot + SQS parse + DDB."
+  },
+
+  "beaconstac_ip_bot_scans_report": {
+    "what_it_does": "Daily report of suspicious IP addresses (bots scanning QR codes en masse) for the security team to review.",
+    "trigger": "Scheduled (once a day).",
+    "ui_flow": ["Internal tool — sends email/Slack to security team."],
+    "how_to_verify": ["Security team reviews the daily digest."],
+    "external_systems": ["Email/Slack delivery"],
+    "floci_tested": "Boot + scheduled trigger + DDB query."
+  },
+
+  "beaconstac_lead_scoring": {
+    "what_it_does": "Scores user accounts based on engagement metrics (logins, QRs created, forms built) to flag likely upgraders for sales.",
+    "trigger": "Scheduled (daily).",
+    "ui_flow": ["Internal tool — sales team sees scores in their CRM, not the customer-facing UI."],
+    "how_to_verify": ["Score appears next to user in HubSpot/Salesforce."],
+    "external_systems": ["HubSpot or Salesforce API"],
+    "floci_tested": "Boot — handler is currently commented out in serverless.yml."
+  },
+
+  "beaconstac_product_scan_counter": {
+    "what_it_does": "Updates per-product scan counts (for product-tracking QRs) on a schedule.",
+    "trigger": "Scheduled (every few minutes).",
+    "ui_flow": [
+      "1. Create a Product QR → scan it 5 times.",
+      "2. Wait for next scheduled run."
+    ],
+    "how_to_verify": ["Product page shows scan count = 5."],
+    "external_systems": ["None"],
+    "floci_tested": "Boot + scheduled + DDB update."
+  },
+
+  "beaconstac_publish_user_properties_amplitude": {
+    "what_it_does": "Pushes user property updates (plan, role, team) to Amplitude for product analytics.",
+    "trigger": "Backend SQS message on user property change.",
+    "ui_flow": [
+      "1. Update a user's plan/role/anything in admin panel.",
+      "2. Wait ~5 seconds."
+    ],
+    "how_to_verify": ["Amplitude → User Lookup → property updated."],
+    "external_systems": ["Amplitude API"],
+    "floci_tested": "Boot + SQS parse."
+  },
+
+  "beaconstac_publish_user_properties_firebase": {
+    "what_it_does": "Same as above but to Firebase (used by mobile apps).",
+    "trigger": "Backend SQS message on user property change.",
+    "ui_flow": ["Update user property → check Firebase user properties."],
+    "how_to_verify": ["Firebase console → Authentication → user → custom claims updated."],
+    "external_systems": ["Firebase Admin SDK"],
+    "floci_tested": "Boot + SQS parse."
+  },
+
+  "beaconstac_reporting": {
+    "what_it_does": "Generates product usage reports (likely PDF/Excel).",
+    "trigger": "User-initiated from dashboard (likely 'Export Report').",
+    "ui_flow": ["1. Dashboard → Reports → click Export.", "2. Wait."],
+    "how_to_verify": ["File downloads, contents match dashboard data."],
+    "external_systems": ["None"],
+    "floci_tested": "Boot + report generation."
+  },
+
+  "beaconstac_request_logs": {
+    "what_it_does": "Sanitizes incoming HTTP request logs (strips bearer tokens, cookies) before they go to S3.",
+    "trigger": "Kinesis Firehose stream of API requests.",
+    "ui_flow": ["Internal observability — not user-facing."],
+    "how_to_verify": ["Check S3 logs → no auth headers present."],
+    "external_systems": ["None"],
+    "floci_tested": "Boot + Firehose record sanitization."
+  },
+
+  "beaconstac_scan_details": {
+    "what_it_does": "Generates the 'Scan Details' Excel/CSV when a user exports detailed scan history.",
+    "trigger": "User clicks 'Export Scans' / SQS triggered.",
+    "ui_flow": [
+      "1. Dashboard → Analytics → pick a QR with scans → click 'Export Detailed Scans'.",
+      "2. Wait."
+    ],
+    "how_to_verify": ["Excel file downloads with one row per scan, location/device/timestamp filled in."],
+    "external_systems": ["None"],
+    "floci_tested": "Boot + SQS parse + Excel generation + S3 upload."
+  },
+
+  "beaconstac_scans_map_view": {
+    "what_it_does": "Pre-aggregates scan data so the map view in analytics loads fast (no on-the-fly geo lookups).",
+    "trigger": "Scheduled (rolls up data periodically).",
+    "ui_flow": [
+      "1. Scan a QR from a few different locations (or use VPN).",
+      "2. Wait for scheduled run.",
+      "3. Dashboard → Analytics → Map view."
+    ],
+    "how_to_verify": ["Map shows pins at all the locations you scanned from."],
+    "external_systems": ["IP-to-geo service (likely MaxMind)"],
+    "floci_tested": "Boot + scheduled + S3 read/write."
+  },
+
+  "beaconstac_search": {
+    "what_it_does": "Indexes data into Elasticsearch so the dashboard's search bar (find a QR, find a user) works fast.",
+    "trigger": "Kinesis stream — every CRUD operation on indexed entities.",
+    "ui_flow": [
+      "1. Create a new QR with a unique name.",
+      "2. Wait ~5 seconds.",
+      "3. Dashboard search bar → type the unique name."
+    ],
+    "how_to_verify": ["The new QR appears in search results."],
+    "external_systems": ["Elasticsearch / OpenSearch cluster"],
+    "floci_tested": "Boot + Kinesis record parse — ES write NOT tested locally."
+  },
+
+  "beaconstac_server_forms_app_sync": {
+    "what_it_does": "Syncs form definitions / responses between the main backend and the mobile-app forms service.",
+    "trigger": "Backend SQS message on form change.",
+    "ui_flow": [
+      "1. Edit a form on the dashboard.",
+      "2. Open the Uniqode mobile app → Forms section."
+    ],
+    "how_to_verify": ["Mobile app shows the updated form."],
+    "external_systems": ["Mobile forms service"],
+    "floci_tested": "Boot + SQS parse."
+  },
+
+  "beaconstac_webhook_service": {
+    "what_it_does": "The webhook execution engine — executes pending webhook deliveries and schedules retries on failure.",
+    "trigger": "Two parts: a poll-scheduler (cron-like) finds due webhooks, executor sends them.",
+    "ui_flow": ["Same as beaconstac_events_sender — configure a webhook + trigger an event."],
+    "how_to_verify": ["webhook.site receives the call.", "Failed webhooks retry with backoff."],
+    "external_systems": ["Customer's webhook URL"],
+    "floci_tested": "Boot + SQS parse + DDB schedule read/write."
+  },
+
+  "beaconstac_zoominfo_enrichment": {
+    "what_it_does": "Enriches new signup user data with company info from ZoomInfo (industry, employees, revenue) for sales targeting.",
+    "trigger": "Scheduled (daily).",
+    "ui_flow": ["Internal tool — sales sees enriched data in CRM."],
+    "how_to_verify": ["HubSpot/Salesforce contact has industry/company size populated."],
+    "external_systems": ["ZoomInfo API"],
+    "floci_tested": "Boot + scheduled + S3 read/write."
+  },
+
+  "cloudfront_analytics_dlq": {
+    "what_it_does": "Reprocesses CloudFront events that previously failed (dead-letter queue handler).",
+    "trigger": "DLQ message from a failed earlier processing.",
+    "ui_flow": ["Internal — not user-facing."],
+    "how_to_verify": ["Failed events drain from DLQ; analytics counts catch up."],
+    "external_systems": ["None"],
+    "floci_tested": "Boot + SQS parse."
+  },
+
+  "cloudwatch_slack": {
+    "what_it_does": "Posts CloudWatch alarms (e.g. 'API error rate >5%') to Slack channels for on-call engineers.",
+    "trigger": "CloudWatch alarm fires.",
+    "ui_flow": ["Internal — engineering only."],
+    "how_to_verify": ["#alerts Slack channel receives a message when an alarm fires."],
+    "external_systems": ["Slack webhook"],
+    "floci_tested": "Boot + SNS event parse."
+  },
+
+  "email_reports": {
+    "what_it_does": "Generates and emails weekly analytics reports for QR / DBC / Polo customers (separate handlers per product).",
+    "trigger": "Backend SQS message scheduled weekly.",
+    "ui_flow": [
+      "1. Wait until Monday morning.",
+      "2. Check inbox of any user who has 'Weekly Report' enabled."
+    ],
+    "how_to_verify": ["Email arrives with last-week's scan/view counts and charts."],
+    "external_systems": ["AWS SES"],
+    "floci_tested": "Boot + SQS parse + report generation."
+  },
+
+  "gen-ai-qr-codes": {
+    "what_it_does": "Generates artistic AI-styled QR codes (the 'AI QR' feature) — uses an image diffusion model.",
+    "trigger": "User clicks 'Generate AI QR' in the dashboard.",
+    "ui_flow": [
+      "1. Dashboard → QR Codes → Create → AI Style.",
+      "2. Pick a theme prompt (e.g. 'cyberpunk neon').",
+      "3. Click Generate.",
+      "4. Wait 20-60 seconds."
+    ],
+    "how_to_verify": [
+      "Image renders with the chosen style.",
+      "Scanning it still resolves the destination URL.",
+      "Generate twice with same prompt → results differ slightly (random seed)."
+    ],
+    "external_systems": ["AI image generation API (likely Replicate or similar)"],
+    "floci_tested": "Boot + SQS parse — actual diffusion call NOT tested."
+  },
+
+  "scan_guard_daily_email_digest": {
+    "what_it_does": "Daily digest of suspicious scan activity to QR owners (e.g. 'we blocked 50 bot scans on your code yesterday').",
+    "trigger": "Scheduled daily.",
+    "ui_flow": [
+      "1. Have a QR with active 'Scan Guard' setting on.",
+      "2. Wait until next morning."
+    ],
+    "how_to_verify": ["Email arrives with digest of blocked attempts."],
+    "external_systems": ["AWS SES"],
+    "floci_tested": "Boot + scheduled + SQS sub-flow."
+  },
+
+  "third-eye-webhook-consumer": {
+    "what_it_does": "Receives webhooks from a third-party service (Third Eye — likely a fraud/security partner).",
+    "trigger": "External HTTP POST from Third Eye.",
+    "ui_flow": ["Internal integration — admin tools only."],
+    "how_to_verify": ["Admin dashboard reflects the incoming data."],
+    "external_systems": ["Third Eye webhook source"],
+    "floci_tested": "Boot + HTTP event parse."
+  },
+
+  "third-eye-webhook-data-transformer": {
+    "what_it_does": "Reshapes Third Eye webhook payloads before storing them.",
+    "trigger": "DynamoDB stream after consumer writes the raw event.",
+    "ui_flow": ["Internal — pipeline step."],
+    "how_to_verify": ["Transformed records appear in target store."],
+    "external_systems": ["None"],
+    "floci_tested": "Boot + DDB stream parse."
+  },
+
+  "una_ai_chat_data_stream_to_firehose": {
+    "what_it_does": "Pipes Uniqode's AI chat (Una) sessions and messages into the analytics warehouse.",
+    "trigger": "DynamoDB stream of chat events.",
+    "ui_flow": [
+      "1. Use the in-product AI chat (Una) — ask it any question.",
+      "2. Wait for analytics rollup."
+    ],
+    "how_to_verify": ["Chat usage shows up in internal analytics dashboards."],
+    "external_systems": ["AWS Firehose"],
+    "floci_tested": "Boot + DDB stream + Firehose put."
+  },
+
+  "uniqode_anomaly_synthetic_data_generator": {
+    "what_it_does": "Generates synthetic 'anomalous' scan data for testing anomaly-detection models. Internal QA tool.",
+    "trigger": "Scheduled (test data generation runs).",
+    "ui_flow": ["Internal QA — not customer-facing."],
+    "how_to_verify": ["Synthetic data appears in the dev analytics store."],
+    "external_systems": ["None"],
+    "floci_tested": "Boot + scheduled + S3 write."
+  },
+
+  "wallet_pass_email_sender": {
+    "what_it_does": "Emails Apple Wallet / Google Wallet pass files (.pkpass) to users who request them (e.g. event ticket QR).",
+    "trigger": "Backend SQS message after wallet pass is generated.",
+    "ui_flow": [
+      "1. Create a QR with 'Wallet Pass' option enabled.",
+      "2. Public scan page → click 'Add to Wallet'.",
+      "3. Provide an email address.",
+      "4. Wait ~10 seconds."
+    ],
+    "how_to_verify": ["Email arrives with .pkpass attachment.", "Tap on iPhone → opens in Apple Wallet."],
+    "external_systems": ["AWS SES"],
+    "floci_tested": "Boot + SQS parse + SES send."
+  },
+
+  "webpage-parser-service": {
+    "what_it_does": "Scrapes / parses webpages — likely to extract Open Graph data when a user enters a URL (for link previews on link pages).",
+    "trigger": "Backend call when a URL is added.",
+    "ui_flow": [
+      "1. Dashboard → Link Pages → add a link block → paste a URL.",
+      "2. Wait ~3 seconds."
+    ],
+    "how_to_verify": ["The link block auto-fills with title, description, thumbnail from that URL."],
+    "external_systems": ["The target webpage being scraped (any HTTPS site)"],
+    "floci_tested": "Boot + S3 read/write — actual HTTP scrape NOT tested."
+  },
+
+  "weekly_analytics_mailer": {
+    "what_it_does": "Older variant of email_reports — likely being deprecated. Sends weekly analytics emails.",
+    "trigger": "Scheduled weekly.",
+    "ui_flow": ["Same as email_reports — check inbox Monday morning."],
+    "how_to_verify": ["Email arrives with weekly stats."],
+    "external_systems": ["AWS SES"],
+    "floci_tested": "Boot + scheduled + report build."
+  }
+}
