@@ -8,15 +8,5 @@
   "beaconstac_pdf_compressor": {
     "S3_BUCKET": "beaconstac-pdf-compressor-local",
     "BEACONSTAC_API_KEY": "test"
-  },
-  "MyFunction": {
-    "AWS_ACCESS_KEY_ID": "test",
-    "AWS_SECRET_ACCESS_KEY": "test",
-    "AWS_DEFAULT_REGION": "us-east-1",
-    "S3_BUCKET": "test-bucket",
-    "SQS_QUEUE_URL": "http://host.docker.internal:4566/000000000000/test-queue",
-    "DYNAMODB_TABLE": "test-table",
-    "SNS_TOPIC_ARN": "arn:aws:sns:us-east-1:000000000000:test-topic",
-    "ENVIRONMENT": "local"
   }
 }

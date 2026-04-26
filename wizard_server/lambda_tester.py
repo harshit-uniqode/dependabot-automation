@@ -462,9 +462,12 @@ def _load_env_vars(project_root, fn_name):
 
 
 def _env_vars_str(env_dict):
-    """Serialize env dict to AWS CLI --environment Variables={K=V,...} format."""
-    pairs = ",".join(f"{k}={v}" for k, v in env_dict.items())
-    return f"Variables={{{pairs}}}"
+    """Serialize env dict to AWS CLI --environment JSON shorthand.
+
+    Use JSON form (not Variables=K=V,...) so values containing `,`, `=`,
+    `{`, `}` or whitespace round-trip safely.
+    """
+    return json.dumps({"Variables": {str(k): str(v) for k, v in env_dict.items()}})
 
 
 def _awslocal_or_aws():
@@ -553,7 +556,7 @@ def deploy(fn_meta, project_root):
 
         env_dict = _load_env_vars(project_root, fn_meta["name"])
         env_vars_str = _env_vars_str(env_dict)
-        _log(jid, f"Env vars: {list(env_dict.keys())}")
+        _log(jid, f"Env vars: {len(env_dict)} keys loaded")
         _log(jid, f"Deploying {fn_name} (runtime={runtime}, handler={handler})...")
 
         # Try update first; fallback to create
@@ -571,12 +574,15 @@ def deploy(fn_meta, project_root):
             # Function existed — also refresh env vars so any changes in
             # lambda-env-vars.json take effect (update-function-code does not touch env)
             _log(jid, "Function updated — refreshing env vars...")
-            _run(
+            rc2, _, stderr2 = _run(
                 cli + ["lambda", "update-function-configuration",
                        "--function-name", fn_name,
                        "--environment", env_vars_str],
                 timeout=60, jid=jid,
             )
+            if rc2 != 0:
+                _finish(jid, "error", {"error": f"update-function-configuration failed: {stderr2[:500]}"})
+                return
         else:
             _log(jid, "Function does not exist yet, creating...")
             # Code arg differs by path
@@ -785,8 +791,13 @@ def invoke(fn_meta, event_file, project_root):
 
     def _task():
         fn_name = "local-" + fn_meta["name"].replace("_", "-").lower()
-        event_path = Path(project_root) / "lambda-test-events" / event_file
-        if not event_path.exists():
+        events_dir = (Path(project_root) / "lambda-test-events").resolve()
+        try:
+            event_path = (events_dir / event_file).resolve()
+        except (OSError, ValueError):
+            _finish(jid, "error", {"error": f"Invalid event file: {event_file}"})
+            return
+        if event_path.parent != events_dir or not event_path.is_file():
             _finish(jid, "error", {"error": f"Event file not found: {event_file}"})
             return
 

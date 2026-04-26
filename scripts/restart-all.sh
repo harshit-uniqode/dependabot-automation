@@ -61,8 +61,8 @@ fi
 ok "Docker daemon responsive."
 
 # ── 1. Kill wizard ──────────────────────────────────────────────────
-say "Stopping wizard on :$WIZARD_PORT…"
-PIDS="$(lsof -ti tcp:$WIZARD_PORT 2>/dev/null || true)"
+say "Stopping wizard on :${WIZARD_PORT}…"
+PIDS="$(lsof -ti "tcp:${WIZARD_PORT}" 2>/dev/null || true)"
 if [ -n "$PIDS" ]; then
   echo "$PIDS" | xargs kill -TERM 2>/dev/null || true
   sleep 1
@@ -82,11 +82,20 @@ with_timeout 45 docker compose -f "$LS_COMPOSE" down --remove-orphans >/dev/null
   || warn "LocalStack compose-down timed out/failed — continuing."
 
 # Kill any leftover Lambda sub-containers
-LAMBDA_CIDS="$(with_timeout 10 docker ps -q --filter 'name=localstack-lambda-' 2>/dev/null || true)"
+LAMBDA_CIDS="$(with_timeout 10 docker ps -aq --filter 'name=localstack-lambda-' 2>/dev/null || true)"
 if [ -n "$LAMBDA_CIDS" ]; then
   say "Removing leftover Lambda sub-containers…"
   echo "$LAMBDA_CIDS" | xargs -r docker rm -f 2>/dev/null || true
 fi
+
+# Force-remove the main emulator container if compose-down left it behind
+# (happens when docker daemon was restarted while compose was orphaned)
+for stale in lambda-test-emulator localstack-main; do
+  if with_timeout 5 docker inspect "$stale" >/dev/null 2>&1; then
+    say "Removing stale container $stale…"
+    with_timeout 15 docker rm -f "$stale" >/dev/null 2>&1 || warn "Could not remove $stale"
+  fi
+done
 ok "Emulators stopped."
 
 # ── 3. Start Floci ──────────────────────────────────────────────────

@@ -276,6 +276,10 @@ class WizardHandler(SimpleHTTPRequestHandler):
         if not repo_name or not fn_name or not event_file:
             self._json_response(400, {"error": "repo, function, event required"})
             return
+        # Reject path-traversal and absolute paths at the boundary
+        if not isinstance(event_file, str) or "/" in event_file or "\\" in event_file or event_file.startswith("."):
+            self._json_response(400, {"error": "invalid event filename"})
+            return
         fn_meta = lambda_tester.find_function(_repos_info, repo_name, fn_name)
         if not fn_meta:
             self._json_response(404, {"error": f"function not found: {repo_name}/{fn_name}"})
@@ -319,9 +323,11 @@ class WizardHandler(SimpleHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
 
     def log_message(self, format, *args):
-        """Suppress default access logs for cleaner output. Only log errors."""
-        if args and str(args[0]).startswith("4") or str(args[0]).startswith("5"):
-            super().log_message(format, *args)
+        """Suppress default access logs for cleaner output. Only log 4xx/5xx."""
+        if args:
+            code = str(args[0])
+            if code.startswith("4") or code.startswith("5"):
+                super().log_message(format, *args)
 
 
 # ─────────────────────────────────────────────────────────────
