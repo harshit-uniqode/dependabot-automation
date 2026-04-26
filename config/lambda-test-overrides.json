@@ -1,0 +1,263 @@
+{
+  "_meta": {
+    "purpose": "Per-Lambda overrides to make Seed + Pre-flight check work without source-code edits.",
+    "schema": {
+      "fixture_keys": "{ <s3-object-key>: <'fixture://<file>' | absolute-path> } — Seed will upload these files to the Lambda's first detected S3 bucket under each given key.",
+      "extra_buckets": "[<bucket-name>] — additional S3 buckets to create that aren't auto-detected from serverless.yml.",
+      "extra_queues": "[<queue-name>] — additional SQS queues to create.",
+      "extra_tables": "[<table-name>] — additional DDB tables to create.",
+      "skip_seed": "true → skip Seed step entirely (Lambda has no AWS deps).",
+      "skip_preflight": "true → skip Pre-flight (Lambda is pure compute, no I/O).",
+      "external_apis_required": "[<host>] — third-party hosts the Lambda will call. Pre-flight warns these will fail in Floci. Informational only.",
+      "notes": "Free-form text shown in pre-flight output."
+    }
+  },
+
+  "beaconstac_pdf_compressor": {
+    "fixture_keys": {
+      "test-document.pdf": "fixture://sample-tiny.pdf",
+      "949/ac0e92c33e8545699e567ebb553efae2": "fixture://sample-tiny.pdf"
+    },
+    "extra_buckets": ["beaconstac-pdf-compressor-local"],
+    "notes": "Reads s3://${S3_BUCKET}/${event.key} and writes ${event.key}-old. Ghostscript runs in-container."
+  },
+
+  "beaconstac_image_optimizer": {
+    "fixture_keys": {
+      "uploads/test-image.png": "fixture://sample-tiny.png",
+      "uploads/test-image.jpg": "fixture://sample-tiny.jpg"
+    },
+    "notes": "Reads S3 image, resizes via Pillow, writes back."
+  },
+
+  "beaconstac_svg_sanitizer": {
+    "fixture_keys": {
+      "uploads/test-logo.svg": "fixture://sample-tiny.svg"
+    },
+    "notes": "Reads SVG, sanitizes via DOMPurify, writes back."
+  },
+
+  "beaconstac_email_service": {
+    "external_apis_required": ["AWS SES (Floci-emulated, OK)"],
+    "notes": "SQS-triggered, sends via SES. Floci has SES emulator — emails go to fake mailbox."
+  },
+
+  "polo_email_service": {
+    "external_apis_required": ["AWS SES (Floci-emulated, OK)"],
+    "notes": "Same as beaconstac_email_service but for Polo."
+  },
+
+  "forms-response-sync-service": {
+    "external_apis_required": [
+      "https://sheets.googleapis.com (Google Sheets API)",
+      "https://www.googleapis.com (Google Drive API)",
+      "AUTH_SERVER_BASE_URL (Django backend OAuth)"
+    ],
+    "notes": "Real Google sync NOT possible under Floci. Test verifies SQS parse + retry flow. For end-to-end, use staging."
+  },
+
+  "beaconstac_qr_code_generator": {
+    "notes": "Pure generator — no S3 fixtures needed. Output written to S3 by handler."
+  },
+
+  "beaconstac_bulk_qr_generator": {
+    "external_apis_required": ["AWS ECS RunTask (NOT in Floci)"],
+    "notes": "Kicks off an ECS task. Floci does not emulate ECS — invoke will fail at ECS RunTask call."
+  },
+
+  "uniqode-print-qr-codes-pdf": {
+    "extra_queues": ["local-uniqode-qr-print-request-queue", "local-uniqode-qr-print-request-dead-letter-queue"],
+    "notes": "SQS-triggered, generates printable PDF, uploads to S3."
+  },
+
+  "beaconstac_analytics": {
+    "skip_seed": true,
+    "notes": "Firehose record sanitiser — receives records inline via the test event, no S3/SQS deps."
+  },
+
+  "beaconstac_request_logs": {
+    "skip_seed": true,
+    "notes": "Firehose record sanitiser — receives records inline."
+  },
+
+  "beaconstac_analytics_data_stream_to_firehose": {
+    "skip_seed": true,
+    "external_apis_required": ["AWS Firehose (NOT in Floci)"],
+    "notes": "DDB stream → Firehose. Firehose put_record will fail under Floci."
+  },
+
+  "beaconstac_analytics_validator": {
+    "skip_seed": true,
+    "notes": "Internal QA, DDB stream input only."
+  },
+
+  "una_ai_chat_data_stream_to_firehose": {
+    "skip_seed": true,
+    "external_apis_required": ["AWS Firehose (NOT in Floci)"],
+    "notes": "Same as analytics_data_stream_to_firehose but for AI chat."
+  },
+
+  "third-eye-webhook-data-transformer": {
+    "skip_seed": true,
+    "notes": "DDB stream consumer — pure transform."
+  },
+
+  "beaconstac_search": {
+    "skip_seed": true,
+    "external_apis_required": ["Elasticsearch / OpenSearch cluster (NOT in Floci)"],
+    "notes": "Kinesis stream → ES. ES write will fail."
+  },
+
+  "cloudwatch_slack": {
+    "external_apis_required": ["https://hooks.slack.com (NOT in Floci)"],
+    "notes": "SNS-triggered. Will fail at Slack webhook POST."
+  },
+
+  "beaconstac_intercom_rate_limiter": {
+    "external_apis_required": ["https://api.intercom.io (NOT in Floci)"],
+    "notes": "Will fail at Intercom API call."
+  },
+
+  "beaconstac_intercom_rate_limiter_polo": {
+    "external_apis_required": ["https://api.intercom.io (NOT in Floci)"],
+    "notes": "Polo variant."
+  },
+
+  "beaconstac_publish_user_properties_amplitude": {
+    "external_apis_required": ["https://api.amplitude.com (NOT in Floci)"],
+    "notes": "Will fail at Amplitude API."
+  },
+
+  "beaconstac_publish_user_properties_firebase": {
+    "external_apis_required": ["Firebase Admin SDK (NOT in Floci)"],
+    "notes": "Will fail at Firebase auth."
+  },
+
+  "beaconstac_zoominfo_enrichment": {
+    "external_apis_required": ["https://api.zoominfo.com (NOT in Floci)"],
+    "notes": "Will fail at ZoomInfo API."
+  },
+
+  "beaconstac_malware_detection": {
+    "external_apis_required": ["Google Safe Browsing or similar threat feed"],
+    "notes": "Scheduled. Will fail at threat-feed API."
+  },
+
+  "beaconstac_lead_scoring": {
+    "external_apis_required": ["HubSpot/Salesforce API"],
+    "notes": "Handler is currently commented out in serverless.yml."
+  },
+
+  "beaconstac_azure_integration_tunnel": {
+    "external_apis_required": ["Azure AD"],
+    "notes": "HTTP-triggered. Real Azure handshake won't work locally."
+  },
+
+  "beaconstac_cloudfront_invalidator": {
+    "external_apis_required": ["AWS CloudFront API (NOT in Floci)"],
+    "notes": "Will fail at CloudFront create-invalidation."
+  },
+
+  "beaconstac_cloudfront_lambda@edge_handler": {
+    "skip_seed": true,
+    "notes": "Lambda@Edge — special runtime constraints; basic boot test only."
+  },
+
+  "beaconstac_custom_domain_ssl_handler": {
+    "external_apis_required": ["AWS ACM (NOT in Floci)", "DNS lookups"],
+    "notes": "Will fail at ACM cert request."
+  },
+
+  "beaconstac_events_sender": {
+    "external_apis_required": ["Customer-configured webhook URLs"],
+    "notes": "Will fail at customer webhook POST. Use webhook.site for staging."
+  },
+
+  "beaconstac_webhook_service": {
+    "external_apis_required": ["Customer webhook URLs"],
+    "notes": "Same as events_sender — customer URL HTTPS calls."
+  },
+
+  "beaconstac_ip_bot_scans_report": {
+    "notes": "Scheduled report. Reads DDB, sends email/Slack."
+  },
+
+  "beaconstac_product_scan_counter": {
+    "notes": "Scheduled, reads/writes DDB."
+  },
+
+  "beaconstac_profile_picture": {
+    "notes": "Scheduled. Generates avatar PNG, uploads to S3."
+  },
+
+  "beaconstac_reporting": {
+    "notes": "Generates report file."
+  },
+
+  "beaconstac_scan_details": {
+    "notes": "SQS-triggered. Generates Excel from DDB data."
+  },
+
+  "beaconstac_scans_map_view": {
+    "external_apis_required": ["MaxMind or similar IP-to-geo (may be local)"],
+    "notes": "Scheduled. S3 read/write."
+  },
+
+  "beaconstac_scheduler": {
+    "notes": "Scheduled. DDB query + update."
+  },
+
+  "beaconstac_server_forms_app_sync": {
+    "notes": "SQS-triggered."
+  },
+
+  "cloudfront_analytics_dlq": {
+    "notes": "Reprocesses failed CloudFront events. SQS DLQ consumer."
+  },
+
+  "email_reports": {
+    "external_apis_required": ["AWS SES (Floci-emulated, OK)"],
+    "notes": "Weekly digest emails."
+  },
+
+  "scan_guard_daily_email_digest": {
+    "external_apis_required": ["AWS SES (Floci-emulated, OK)"],
+    "notes": "Scheduled daily digest."
+  },
+
+  "third-eye-webhook-consumer": {
+    "external_apis_required": ["Third Eye partner webhook"],
+    "notes": "HTTP-triggered. External party calls in."
+  },
+
+  "uniqode_anomaly_synthetic_data_generator": {
+    "skip_seed": true,
+    "notes": "Internal QA, generates fake data."
+  },
+
+  "wallet_pass_email_sender": {
+    "external_apis_required": ["AWS SES (Floci-emulated, OK)"],
+    "notes": "SQS-triggered email send."
+  },
+
+  "webpage-parser-service": {
+    "external_apis_required": ["Any HTTPS site (target webpages)"],
+    "notes": "Scrapes HTTP — will fail without real network in Floci."
+  },
+
+  "weekly_analytics_mailer": {
+    "external_apis_required": ["AWS SES (Floci-emulated, OK)"],
+    "notes": "Older variant of email_reports."
+  },
+
+  "beaconstac_analytics_pdf_generator": {
+    "notes": "SQS-triggered. PDF gen + S3 upload."
+  },
+
+  "gen-ai-qr-codes": {
+    "skip_seed": true,
+    "skip_preflight": true,
+    "external_apis_required": ["AI image generation API (Replicate or similar)"],
+    "notes": "Empty dir at the moment — no serverless.yml."
+  }
+}

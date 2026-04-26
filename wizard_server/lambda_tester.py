@@ -628,7 +628,80 @@ def deploy(fn_meta, project_root):
 # SEED — auto-create AWS resources the Lambda expects
 # ─────────────────────────────────────────────────────────────
 
-def _detect_resources(fn_meta):
+def _load_overrides(project_root, fn_name):
+    """Load per-Lambda overrides from config/lambda-test-overrides.json.
+
+    Returns the entry for fn_name, or empty dict if none.
+    """
+    overrides_file = Path(project_root) / "config" / "lambda-test-overrides.json"
+    if not overrides_file.is_file():
+        return {}
+    try:
+        data = json.loads(overrides_file.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return data.get(fn_name, {}) or {}
+
+
+def _resolve_fixture(uri, project_root):
+    """Resolve a fixture URI to an absolute filesystem path.
+
+    Accepts:
+      - fixture://<filename> → lambda-test-assets/<filename>
+      - absolute path → returned as-is
+      - relative path → resolved against project_root
+
+    Returns Path or None if file does not exist.
+    """
+    if not uri:
+        return None
+    if uri.startswith("fixture://"):
+        rel = uri[len("fixture://"):]
+        candidate = Path(project_root) / "lambda-test-assets" / rel
+    elif uri.startswith("/"):
+        candidate = Path(uri)
+    else:
+        candidate = Path(project_root) / uri
+    return candidate if candidate.is_file() else None
+
+
+def _extract_event_keys(event_file_path):
+    """Walk the test event JSON and return list of (key_name, value) pairs
+    for fields that look like S3 object keys, queue URLs, table names.
+
+    Used by Seed to pre-create objects the handler will read from.
+    """
+    refs = {"s3_keys": [], "queue_urls": [], "table_names": [], "buckets": []}
+    if not event_file_path or not Path(event_file_path).is_file():
+        return refs
+    try:
+        data = json.loads(Path(event_file_path).read_text())
+    except (json.JSONDecodeError, OSError):
+        return refs
+
+    def walk(node, parent_key=None):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                kl = k.lower()
+                if isinstance(v, str):
+                    if kl == "key" and not v.startswith("$"):
+                        refs["s3_keys"].append(v)
+                    elif kl in ("name", "bucket") and parent_key == "bucket":
+                        refs["buckets"].append(v)
+                    elif kl in ("queueurl", "queue_url"):
+                        refs["queue_urls"].append(v)
+                    elif kl in ("tablename", "table_name"):
+                        refs["table_names"].append(v)
+                walk(v, k)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item, parent_key)
+
+    walk(data)
+    return refs
+
+
+def _detect_resources(fn_meta, project_root=None):
     """Parse serverless.yml + handler source to infer AWS resources needed.
 
     Returns dict with keys:
@@ -636,6 +709,9 @@ def _detect_resources(fn_meta):
       sqs_queues   — list of queue names
       ddb_tables   — list of table names
       ses_identities — list of email addresses to verify
+
+    If project_root is provided, also merges in extras from
+    config/lambda-test-overrides.json for this Lambda.
     """
     resources = {"s3_buckets": set(), "sqs_queues": set(), "ddb_tables": set(), "ses_identities": set()}
     fn_dir = Path(fn_meta["path"])
@@ -695,6 +771,16 @@ def _detect_resources(fn_meta):
             except (UnicodeDecodeError, OSError):
                 pass
 
+    # Merge per-Lambda overrides (extra_buckets / extra_queues / extra_tables)
+    if project_root:
+        overrides = _load_overrides(project_root, fn_meta["name"])
+        for b in overrides.get("extra_buckets", []) or []:
+            resources["s3_buckets"].add(b)
+        for q in overrides.get("extra_queues", []) or []:
+            resources["sqs_queues"].add(q)
+        for t in overrides.get("extra_tables", []) or []:
+            resources["ddb_tables"].add(t)
+
     # Convert sets to sorted lists for deterministic output
     return {k: sorted(v) for k, v in resources.items()}
 
@@ -714,7 +800,21 @@ def seed(fn_meta, project_root):
             _finish(jid, "error", {"error": "Neither awslocal nor aws CLI found."})
             return
 
-        resources = _detect_resources(fn_meta)
+        overrides = _load_overrides(project_root, fn_meta["name"])
+
+        if overrides.get("skip_seed"):
+            _log(jid, f"Skipping seed (override: skip_seed=true). Notes: {overrides.get('notes', '')}")
+            _finish(jid, "done", {"created": {"skipped": True, "notes": overrides.get("notes", "")}})
+            return
+
+        ext = overrides.get("external_apis_required") or []
+        if ext:
+            _log(jid, "⚠️  External APIs this Lambda needs (NOT emulated by Floci):")
+            for api in ext:
+                _log(jid, f"   - {api}")
+            _log(jid, "   Local invoke may fail at the external HTTPS call. That is expected.")
+
+        resources = _detect_resources(fn_meta, project_root)
         _log(jid, f"Detected resources: {json.dumps(resources)}")
 
         created = {"s3_buckets": [], "sqs_queues": [], "ddb_tables": [], "ses_identities": [], "fixtures_uploaded": []}
@@ -763,7 +863,7 @@ def seed(fn_meta, project_root):
             if rc == 0:
                 created["ses_identities"].append(email)
 
-        # Upload fixtures (if any) to first detected S3 bucket
+        # Upload fixtures from <fn_dir>/tests/fixtures/* — preserves existing behaviour
         fn_dir = Path(fn_meta["path"])
         fixtures_dir = fn_dir / "tests" / "fixtures"
         if fixtures_dir.is_dir() and created["s3_buckets"]:
@@ -779,10 +879,161 @@ def seed(fn_meta, project_root):
                 if rc == 0:
                     created["fixtures_uploaded"].append(f"s3://{target_bucket}/{f.name}")
 
+        # Override fixture_keys: explicit { key → fixture://file } mapping per Lambda.
+        # Uploaded to EVERY detected bucket so the handler finds it regardless
+        # of which bucket the env var or hardcoded fallback resolves to.
+        fixture_keys = overrides.get("fixture_keys") or {}
+        if fixture_keys:
+            if not created["s3_buckets"]:
+                _log(jid, "⚠️  fixture_keys defined in overrides but no S3 bucket created — skipping uploads")
+            else:
+                for s3_key, uri in fixture_keys.items():
+                    src_path = _resolve_fixture(uri, project_root)
+                    if not src_path:
+                        _log(jid, f"❌ fixture not found for key '{s3_key}': {uri}")
+                        continue
+                    for target_bucket in created["s3_buckets"]:
+                        _log(jid, f"Uploading override fixture: {src_path.name} → s3://{target_bucket}/{s3_key}")
+                        rc, _, _ = _run(
+                            cli + ["s3", "cp", str(src_path), f"s3://{target_bucket}/{s3_key}"],
+                            timeout=60, jid=jid,
+                        )
+                        if rc == 0:
+                            created["fixtures_uploaded"].append(f"s3://{target_bucket}/{s3_key}")
+
         _finish(jid, "done", {"created": created})
 
     threading.Thread(target=_task, daemon=True).start()
     return jid
+
+
+def preflight(fn_meta, event_file, project_root):
+    """Run pre-flight checks BEFORE invoking a Lambda — verify the AWS state
+    the handler will read actually exists. Returns job_id (async).
+
+    Checks performed:
+      - Function deployed in Floci? (lambda get-function)
+      - For each detected S3 bucket: HeadBucket
+      - For each event key field: HeadObject in the first bucket
+      - For each detected SQS queue: GetQueueUrl
+      - For each detected DDB table: DescribeTable
+      - For each env var the handler reads: present in deployed config?
+      - External APIs declared in overrides → warn only (informational)
+
+    The Lambda continues to invoke even if some checks fail — this is
+    diagnostic only. But it surfaces the most common failure modes
+    (missing fixture, missing bucket) before the user sees a cryptic
+    SDK error inside the Lambda container.
+    """
+    jid = _new_job()
+
+    def _task():
+        cli = _awslocal_or_aws()
+        if not cli:
+            _finish(jid, "error", {"error": "Neither awslocal nor aws CLI found."})
+            return
+
+        fn_name = "local-" + fn_meta["name"].replace("_", "-").lower()
+        overrides = _load_overrides(project_root, fn_meta["name"])
+
+        if overrides.get("skip_preflight"):
+            _log(jid, f"Skipping pre-flight (override). Notes: {overrides.get('notes', '')}")
+            _finish(jid, "done", {"checks": [], "skipped": True})
+            return
+
+        results = []  # [(status, label, detail)] — status ∈ {ok, warn, fail}
+
+        # 1. Function deployed?
+        rc, _, stderr = _run(
+            cli + ["lambda", "get-function", "--function-name", fn_name],
+            timeout=15, jid=jid,
+        )
+        if rc == 0:
+            results.append(("ok", "Function deployed", fn_name))
+        else:
+            results.append(("fail", "Function deployed", f"{fn_name} not found — run Build & Deploy first"))
+            _print_preflight(jid, results)
+            _finish(jid, "done", {"checks": results, "passed": False})
+            return
+
+        resources = _detect_resources(fn_meta, project_root)
+
+        # 2. S3 buckets
+        for bucket in resources["s3_buckets"]:
+            rc, _, _ = _run(
+                cli + ["s3api", "head-bucket", "--bucket", bucket],
+                timeout=10, jid=jid,
+            )
+            if rc == 0:
+                results.append(("ok", "Bucket exists", bucket))
+            else:
+                results.append(("fail", "Bucket missing", f"{bucket} — run Seed Resources"))
+
+        # 3. Object keys from test event (HeadObject in first bucket)
+        events_dir = (Path(project_root) / "lambda-test-events").resolve()
+        ev_path = events_dir / event_file if event_file else None
+        if ev_path and ev_path.is_file():
+            event_refs = _extract_event_keys(str(ev_path))
+            target_bucket = resources["s3_buckets"][0] if resources["s3_buckets"] else None
+            for k in event_refs["s3_keys"]:
+                if not target_bucket:
+                    results.append(("warn", "S3 key referenced", f"{k} — no bucket detected to check against"))
+                    continue
+                rc, _, _ = _run(
+                    cli + ["s3api", "head-object", "--bucket", target_bucket, "--key", k],
+                    timeout=10, jid=jid,
+                )
+                if rc == 0:
+                    results.append(("ok", "S3 object present", f"s3://{target_bucket}/{k}"))
+                else:
+                    results.append(("fail", "S3 object missing", f"s3://{target_bucket}/{k} — add to fixture_keys in lambda-test-overrides.json"))
+
+        # 4. SQS queues
+        for queue in resources["sqs_queues"]:
+            rc, _, _ = _run(
+                cli + ["sqs", "get-queue-url", "--queue-name", queue],
+                timeout=10, jid=jid,
+            )
+            if rc == 0:
+                results.append(("ok", "Queue exists", queue))
+            else:
+                results.append(("fail", "Queue missing", f"{queue} — run Seed Resources"))
+
+        # 5. DDB tables
+        for table in resources["ddb_tables"]:
+            rc, _, _ = _run(
+                cli + ["dynamodb", "describe-table", "--table-name", table],
+                timeout=10, jid=jid,
+            )
+            if rc == 0:
+                results.append(("ok", "Table exists", table))
+            else:
+                results.append(("fail", "Table missing", f"{table} — run Seed Resources"))
+
+        # 6. External API warnings
+        for api in overrides.get("external_apis_required") or []:
+            results.append(("warn", "External API (not in Floci)", api))
+
+        # 7. Notes
+        if overrides.get("notes"):
+            results.append(("info", "Notes", overrides["notes"]))
+
+        _print_preflight(jid, results)
+        passed = not any(s == "fail" for s, _, _ in results)
+        _finish(jid, "done", {"checks": results, "passed": passed})
+
+    threading.Thread(target=_task, daemon=True).start()
+    return jid
+
+
+def _print_preflight(jid, results):
+    """Print pre-flight results with status icons inline in the job log."""
+    icons = {"ok": "✅", "fail": "❌", "warn": "⚠️ ", "info": "ℹ️ "}
+    _log(jid, "── Pre-flight checks ─────────────────────")
+    for status, label, detail in results:
+        icon = icons.get(status, "  ")
+        _log(jid, f"  {icon} {label}: {detail}")
+    _log(jid, "──────────────────────────────────────────")
 
 
 def invoke(fn_meta, event_file, project_root):

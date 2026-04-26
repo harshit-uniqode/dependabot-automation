@@ -134,6 +134,8 @@ class WizardHandler(SimpleHTTPRequestHandler):
             self._handle_lambda_seed(body or {})
         elif path == "/api/lambda/invoke":
             self._handle_lambda_invoke(body or {})
+        elif path == "/api/lambda/preflight":
+            self._handle_lambda_preflight(body or {})
         else:
             self._json_response(404, {"error": f"Unknown endpoint: {path}"})
 
@@ -314,6 +316,23 @@ class WizardHandler(SimpleHTTPRequestHandler):
             return
         jid = lambda_tester.invoke(fn_meta, event_file, str(_project_root))
         self._json_response(202, {"job_id": jid, "status": "invoking"})
+
+    def _handle_lambda_preflight(self, body):
+        repo_name = body.get("repo")
+        fn_name = body.get("function")
+        event_file = body.get("event")
+        if not repo_name or not fn_name:
+            self._json_response(400, {"error": "repo and function required"})
+            return
+        if event_file and (not isinstance(event_file, str) or "/" in event_file or "\\" in event_file or event_file.startswith(".")):
+            self._json_response(400, {"error": "invalid event filename"})
+            return
+        fn_meta = lambda_tester.find_function(_repos_info, repo_name, fn_name)
+        if not fn_meta:
+            self._json_response(404, {"error": f"function not found: {repo_name}/{fn_name}"})
+            return
+        jid = lambda_tester.preflight(fn_meta, event_file or "", str(_project_root))
+        self._json_response(202, {"job_id": jid, "status": "preflight"})
 
     # ── API: Cancel ──────────────────────────────────────────
 

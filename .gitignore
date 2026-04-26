@@ -24,3 +24,6 @@ function.zip
 localstack-data/
 docker/data/
 vulnerability-dashboards/.alert-snapshot-*.json
+
+# Claude Code local settings (not for sharing)
+.claude/
