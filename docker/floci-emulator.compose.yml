@@ -1,5 +1,13 @@
 version: "3.8"
 
+# Pin project name so the auto-created network is stable regardless of the
+# parent directory the compose file is run from. Without this, renaming the
+# repo dir changes the network name (e.g. `dependabotvulnerabilitytracker_default`
+# → `localtestingforlambda_default`) and FLOCI_SERVICES_LAMBDA_DOCKER_NETWORK
+# below silently points at a network that does not exist → Lambda init fails
+# with: "Failed to start Lambda container: network ... not found".
+name: floci-lambda-test
+
 # Floci — free, MIT-licensed, zero-auth AWS emulator
 # Covers: S3, SQS, DynamoDB, Lambda, SNS, SES, API Gateway, KMS, CloudWatch
 # Docs: https://github.com/hectorvent/floci
@@ -30,10 +38,9 @@ services:
       # attach the sub-containers to so they can hit the Runtime endpoint.
       # FLOCI_HOSTNAME tells spawned containers to resolve "floci" instead
       # of a container IP that may not route.
-      # Network name is derived by Docker Compose from the parent directory:
-      # lowercased + non-alphanumerics stripped + "_default" suffix.
-      # If you rename the repo dir, regenerate with: docker network ls | grep default
-      - FLOCI_SERVICES_LAMBDA_DOCKER_NETWORK=dependabotvulnerabilitytracker_default
+      # Network name = "<compose project name>_default". Project name is pinned
+      # at the top of this file (`name: floci-lambda-test`) so this stays stable.
+      - FLOCI_SERVICES_LAMBDA_DOCKER_NETWORK=floci-lambda-test_default
       - FLOCI_HOSTNAME=floci
       # ── Storage: hybrid = in-memory for speed + periodic flush to disk ──
       # Lambda code, S3 objects, DDB tables persist across Floci restarts.
