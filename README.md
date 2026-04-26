@@ -148,6 +148,74 @@ See [`docs/local-lambda-testing-guide.md`](docs/local-lambda-testing-guide.md)
 for internals (how Floci spawns the Lambda sub-container, how `handler` paths
 are resolved, how to add a new test event type).
 
+### What Floci actually tests (and what it does NOT)
+
+This is the most-asked question. Floci is a local AWS emulator — it
+faithfully reproduces AWS service APIs (S3, SQS, DynamoDB, Lambda, SES, …),
+but it has **zero awareness of any third-party SaaS your Lambda talks to**
+(Google Sheets, Salesforce, HubSpot, Datadog, etc.).
+
+So when you "test" a Lambda like `forms-response-sync-service` whose entire
+job is to push form responses into Google Sheets, Floci is testing
+**everything up to the network boundary** where the Lambda calls Google's
+API — not the sync itself.
+
+#### Concretely, for `forms-response-sync-service`
+
+The handler at `handler.py:100` does this on every SQS message:
+
+```
+SQS event → JSON parse → loop integrations → handler.sync(...) → requests.post(google_sheets_api)
+```
+
+Floci can test the **left half** of that arrow chain. It cannot test the
+right half because there is no Google in `localhost:4566`.
+
+| Phase                                          | Tested under Floci? | How                                              |
+| ---------------------------------------------- | :-----------------: | ------------------------------------------------ |
+| Lambda cold start + dependency import          | ✅                  | Real container boot inside `floci-lambda-test_default` network |
+| SQS event payload parsing (`Records[].body`)   | ✅                  | We feed the event JSON straight to `lambda invoke --payload` |
+| Env-var loading (`SQS_QUEUE_URL`, `BFORM_*`)   | ✅                  | Injected from `config/lambda-env-vars.json` at deploy time |
+| Boto3 client init (`sqs = boto3.client("sqs")`)| ✅                  | Boto3 is told `AWS_ENDPOINT_URL=http://floci:4566` so the SDK targets Floci |
+| Re-enqueue on retry (`sqs.send_message`)       | ✅                  | Floci has SQS — the message lands in a real local queue |
+| Integration handler dispatch + dict lookup     | ✅                  | Pure Python, runs in the container |
+| `handler.sync()` → `requests.post("https://sheets.googleapis.com/...")` | ❌ | Real network call to Google. Will fail with auth error or get rate-limited. |
+| `report_error_to_bform()` → BForm Lambda URL   | ❌                  | Same — real network call to a real AWS Lambda function URL |
+
+#### What "PASS" actually means here
+
+When the dashboard shows `✅ PASS  StatusCode=200`, you have proven:
+
+1. The deploy zip contains all imports the handler needs (no
+   `ImportModuleError` after a dependency bump — the actual Dependabot
+   safety question we care about).
+2. The handler's SQS event parser does not crash on a valid payload shape.
+3. Boto3 calls to AWS services route correctly through env-vars.
+4. The function exits cleanly within the Lambda timeout.
+
+It does NOT prove that Google Sheets sync still works. That requires
+either:
+
+- **A staging deploy** with a real Google service account credential, or
+- A **mocked** integration handler — replace `handler.sync()` with a
+  stub for the local test event (we don't do this today).
+
+#### Why this is still useful for Dependabot triage
+
+A Dependabot alert almost always boils down to: *"library X bumped from
+1.2.3 → 1.2.4 — does the deploy still work?"* That is exactly the
+left-half-of-the-arrow question. If `requests`, `boto3`, or any transitive
+dep breaks, you'll see it as `ImportModuleError` or a runtime exception in
+the Lambda logs **before** any Google API call is even attempted. So for
+the upgrade-safety verification flow this tool is built for, network-level
+isolation is the correct scope.
+
+#### How to test the actual sync (not Floci's job)
+
+If you want end-to-end "did the row land in the sheet" validation, that
+lives in the **QA staging environment** with real Google credentials and
+a real test sheet — outside this repo's scope.
+
 ---
 
 ## Regenerating dashboards
