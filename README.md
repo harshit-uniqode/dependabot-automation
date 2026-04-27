@@ -148,6 +148,118 @@ See [`docs/local-lambda-testing-guide.md`](docs/local-lambda-testing-guide.md)
 for internals (how Floci spawns the Lambda sub-container, how `handler` paths
 are resolved, how to add a new test event type).
 
+### How the local-test pipeline works (end-to-end)
+
+When you click **3. Invoke** in the Local Testing modal, this happens:
+
+```
+[1. Build & Deploy]
+    ├─ npm install / pip install (arch-matched in container for native deps)
+    ├─ Compile TypeScript if needed (npm run compile / build / npx tsc)
+    ├─ Detect AWS SDK v2 in package.json → inject Floci shim into zip ⚠️
+    ├─ Zip → upload to Floci (inline or via S3 if zip > 50 MB)
+    ├─ create-function or update-function-code
+    └─ update-function-configuration with merged env vars
+       (Parameters block → per-function block → infra defaults → shim NODE_OPTIONS)
+
+[2. Seed Resources]
+    ├─ Read config/lambda-test-overrides.json for this Lambda
+    ├─ Honor skip_seed flag (stream-only Lambdas have nothing to seed)
+    ├─ Warn about external_apis_required (Google, Slack, Intercom, etc.)
+    ├─ Auto-detect S3 buckets / SQS queues / DDB tables / SES identities
+    │   from serverless.yml + handler source
+    ├─ Merge in extra_buckets/queues/tables from overrides
+    ├─ Idempotent create on Floci (BucketAlreadyOwnedByYou → ignore)
+    ├─ Upload <fn_dir>/tests/fixtures/* to first detected bucket
+    └─ Upload override fixture_keys → EVERY detected bucket
+       (uses lambda-test-assets/sample-tiny.{pdf,png,jpg,svg,csv,...})
+
+[3. Pre-flight check] ← runs automatically BEFORE every Invoke
+    ├─ AWS SDK v2 detection → 🔴 RED ALERT if shim not active
+    ├─ Function deployed in Floci? (lambda get-function)
+    ├─ HeadBucket for every detected bucket
+    ├─ HeadObject for every event-file key reference
+    ├─ GetQueueUrl for every detected queue
+    ├─ DescribeTable for every detected table
+    ├─ External-API warnings (informational)
+    └─ Render alerts in modal banner + verdict in console
+
+[3. Invoke]
+    ├─ POST event JSON via awslocal lambda invoke --log-type Tail
+    ├─ Decode log_tail (base64) for in-modal display
+    ├─ Print PASS/FAIL banner with status_code, function_error
+    └─ User sees full execution trace + Lambda return value
+```
+
+**Files involved:**
+
+| Path                                     | Purpose                                                       |
+| ---------------------------------------- | ------------------------------------------------------------- |
+| [`config/lambda-env-vars.json`](config/lambda-env-vars.json) | Per-Lambda env var overrides + global Parameters block |
+| [`config/lambda-test-overrides.json`](config/lambda-test-overrides.json) | Per-Lambda fixture mappings, skip flags, external-API warnings |
+| [`config/lambda-ui-flows.json`](config/lambda-ui-flows.json) | Human-friendly probable UI flow per Lambda (rendered in modal) |
+| [`lambda-test-assets/`](lambda-test-assets/) | Shared synthetic fixtures (`sample-tiny.pdf` etc.) |
+| [`lambda-test-events/`](lambda-test-events/) | Test event JSONs (SQS, S3, DDB, API Gateway shapes)        |
+| [`wizard_server/runtime-shims/aws-sdk-floci-shim.js`](wizard_server/runtime-shims/aws-sdk-floci-shim.js) | 🔴 Auto-injected into Node SDK v2 Lambdas |
+| [`wizard_server/lambda_tester.py`](wizard_server/lambda_tester.py) | Build / deploy / seed / pre-flight / invoke logic |
+
+> ### 🔴 RED ALERT — Node AWS SDK v2 silently bypasses Floci
+>
+> If a Lambda uses **`aws-sdk` v2** (the single non-scoped package — not `@aws-sdk/client-*`),
+> the SDK does **not** honor the `AWS_ENDPOINT_URL` env var. By default,
+> `new AWS.S3()` constructs a client pointing at the **real** AWS S3 in
+> `us-east-1`, ignoring our local Floci endpoint.
+>
+> **Symptom:**
+> ```
+> InvalidAccessKeyId: The AWS Access Key Id you provided does not exist
+> ```
+>
+> **What we do about it:**
+> The wizard server detects `aws-sdk` in the Lambda's `package.json` and
+> auto-injects [`aws-sdk-floci-shim.js`](wizard_server/runtime-shims/aws-sdk-floci-shim.js)
+> into the deploy zip. It is loaded via `NODE_OPTIONS=--require=...` at
+> Lambda cold start, monkey-patches `AWS.S3`, `AWS.SQS`, `AWS.DynamoDB`
+> (etc.) constructors to default-inject the Floci endpoint, and is a
+> no-op outside the local-test environment (only fires when
+> `AWS_ENDPOINT_URL` is set).
+>
+> The Pre-flight check verifies the shim is active and shows a 🔴 banner
+> in the modal if it is not. If you ever see "AWS SDK v2 detected — shim
+> NOT active", click **1. Build & Deploy** again — the shim is injected
+> at build time.
+>
+> Python (`boto3`) honors `AWS_ENDPOINT_URL` natively since v1.28 — no
+> shim needed.
+>
+> Node SDK v3 (`@aws-sdk/*`) honors `AWS_ENDPOINT_URL` natively — no
+> shim needed.
+>
+> Only Node SDK v2 needs the shim. If you upgrade a Lambda to v3, the
+> wizard automatically detects the change and stops injecting the shim
+> on the next deploy.
+
+### Adding a new Lambda to the local-test system
+
+1. Add a `serverless.yml` to the Lambda dir (this already exists for all 47).
+2. Run `make sync-ui-flows` — appends a stub UI-flow entry to
+   [`config/lambda-ui-flows.json`](config/lambda-ui-flows.json). Edit the
+   TODO placeholders with the real flow.
+3. If the handler reads any S3 object key that's not auto-discovered,
+   add a `fixture_keys` mapping to
+   [`config/lambda-test-overrides.json`](config/lambda-test-overrides.json):
+   ```json
+   "my_lambda": {
+     "fixture_keys": {
+       "input/test-file.pdf": "fixture://sample-tiny.pdf"
+     }
+   }
+   ```
+4. If the Lambda only consumes streams (no S3/SQS/DDB writes), add
+   `"skip_seed": true` to its override entry.
+5. If the Lambda calls third-party APIs (Google, Slack, Intercom, etc.),
+   list them in `external_apis_required` so pre-flight warns the user.
+
 ### What Floci actually tests (and what it does NOT)
 
 This is the most-asked question. Floci is a local AWS emulator — it

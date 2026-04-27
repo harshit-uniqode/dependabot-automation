@@ -289,6 +289,46 @@ def _zip_dir(src_dir, zip_path, extra_dirs=None, jid=None):
         _log(jid, f"  [zip] ✓ wrote {files_written} files, final size {final_size_mb:.1f} MB")
 
 
+def _detect_aws_sdk_v2(fn_dir):
+    """Return True if the Lambda uses Node aws-sdk v2 (not v3).
+
+    v2 = `aws-sdk` in dependencies (single package).
+    v3 = `@aws-sdk/client-*` (scoped packages).
+
+    v2 silently ignores AWS_ENDPOINT_URL, so it bypasses Floci and hits
+    real AWS — see runtime-shims/aws-sdk-floci-shim.js for the fix.
+    """
+    pkg = Path(fn_dir) / "package.json"
+    if not pkg.is_file():
+        return False
+    try:
+        data = json.loads(pkg.read_text())
+    except (json.JSONDecodeError, OSError):
+        return False
+    deps = {**data.get("dependencies", {}), **data.get("devDependencies", {})}
+    return "aws-sdk" in deps
+
+
+def _inject_floci_shim(fn_dir, jid):
+    """Copy runtime-shims/aws-sdk-floci-shim.js into the Lambda dir so it
+    gets bundled into the zip. Returns the runtime-relative path the
+    Lambda's NODE_OPTIONS should --require, or None if shim was not needed.
+    """
+    shim_src = Path(__file__).resolve().parent / "runtime-shims" / "aws-sdk-floci-shim.js"
+    if not shim_src.is_file():
+        _log(jid, "⚠️  Floci shim source missing — SDK v2 calls will bypass Floci")
+        return None
+    shim_dest = Path(fn_dir) / "aws-sdk-floci-shim.js"
+    try:
+        shutil.copy2(str(shim_src), str(shim_dest))
+        _log(jid, "🔴 SDK v2 detected — injected Floci shim (aws-sdk-floci-shim.js) into zip root")
+        _log(jid, "   Without this, the AWS SDK ignores AWS_ENDPOINT_URL and bypasses Floci.")
+        return "/var/task/aws-sdk-floci-shim.js"
+    except OSError as e:
+        _log(jid, f"⚠️  Failed to copy shim: {e}")
+        return None
+
+
 def _build_node(fn_dir, jid):
     """npm install + compile TypeScript if needed.
 
@@ -399,6 +439,12 @@ def build_zip(fn_dir, language, jid, runtime="python3.9"):
         ok, msg = _build_node(fn_dir, jid)
         if not ok:
             return False, msg
+
+        # SDK v2 needs a shim (v2 ignores AWS_ENDPOINT_URL).
+        shim_require_path = None
+        if _detect_aws_sdk_v2(fn_dir):
+            shim_require_path = _inject_floci_shim(fn_dir, jid)
+
         # Prefer dist/ if present (TypeScript compile output)
         dist = fn_dir / "dist"
         src_root = dist if dist.exists() else fn_dir
@@ -406,13 +452,27 @@ def build_zip(fn_dir, language, jid, runtime="python3.9"):
         nm = fn_dir / "node_modules"
         if nm.exists():
             extras.append(str(nm))
+        # If TS-compiled to dist/ but shim needs to be at zip root, copy it into dist/ too.
+        if shim_require_path and dist.exists() and src_root == dist:
+            shim_in_dist = dist / "aws-sdk-floci-shim.js"
+            shim_at_root = fn_dir / "aws-sdk-floci-shim.js"
+            if shim_at_root.is_file() and not shim_in_dist.is_file():
+                try:
+                    shutil.copy2(str(shim_at_root), str(shim_in_dist))
+                except OSError:
+                    pass
+
         _log(jid, f"Zipping {src_root} (+node_modules) → {zip_path}")
         _zip_dir(src_root, zip_path, extra_dirs=extras, jid=jid)
+
+        result = {"zip": str(zip_path)}
         # Handler path adjustment: if we zipped dist/ contents at root,
         # strip leading "dist/" from handler so it resolves.
         if dist.exists() and src_root == dist:
-            return True, {"zip": str(zip_path), "handler_prefix_strip": "dist/"}
-        return True, {"zip": str(zip_path)}
+            result["handler_prefix_strip"] = "dist/"
+        if shim_require_path:
+            result["shim_require_path"] = shim_require_path
+        return True, result
 
     if language == "python":
         ok, pkg_dir = _build_python(fn_dir, jid, runtime=runtime)
@@ -555,6 +615,18 @@ def deploy(fn_meta, project_root):
             code_ref = ("inline",)
 
         env_dict = _load_env_vars(project_root, fn_meta["name"])
+
+        # If build_zip injected the SDK-v2 shim, prepend its --require to
+        # NODE_OPTIONS so it loads before the handler. Preserves existing
+        # NODE_OPTIONS (e.g. --no-deprecation) by concatenating.
+        shim_require_path = result.get("shim_require_path") if isinstance(result, dict) else None
+        if shim_require_path:
+            existing = env_dict.get("NODE_OPTIONS", "")
+            require_flag = f"--require={shim_require_path}"
+            if require_flag not in existing:
+                env_dict["NODE_OPTIONS"] = (require_flag + " " + existing).strip()
+            _log(jid, f"🔴 Floci shim active — NODE_OPTIONS={env_dict['NODE_OPTIONS']}")
+
         env_vars_str = _env_vars_str(env_dict)
         _log(jid, f"Env vars: {len(env_dict)} keys loaded")
         _log(jid, f"Deploying {fn_name} (runtime={runtime}, handler={handler})...")
@@ -941,7 +1013,28 @@ def preflight(fn_meta, event_file, project_root):
             _finish(jid, "done", {"checks": [], "skipped": True})
             return
 
-        results = []  # [(status, label, detail)] — status ∈ {ok, warn, fail}
+        results = []  # [(status, label, detail)] — status ∈ {ok, warn, fail, alert, info}
+
+        # 0. AWS SDK v2 detection — RED ALERT if shim isn't active
+        fn_dir = fn_meta.get("path")
+        if fn_dir and _detect_aws_sdk_v2(fn_dir):
+            # Check the deployed Lambda's NODE_OPTIONS for the shim require flag
+            rc, stdout, _ = _run(
+                cli + ["lambda", "get-function-configuration",
+                       "--function-name", fn_name, "--query", "Environment.Variables.NODE_OPTIONS",
+                       "--output", "text"],
+                timeout=10, jid=jid,
+            )
+            shim_active = rc == 0 and "aws-sdk-floci-shim" in (stdout or "")
+            if shim_active:
+                results.append(("ok", "AWS SDK v2 + Floci shim active", "calls will route through Floci"))
+            else:
+                results.append((
+                    "alert",
+                    "🔴 AWS SDK v2 detected — shim NOT active",
+                    "v2 ignores AWS_ENDPOINT_URL → Lambda will hit real AWS and fail with InvalidAccessKeyId. "
+                    "Re-deploy via the dashboard to inject the shim.",
+                ))
 
         # 1. Function deployed?
         rc, _, stderr = _run(
@@ -1019,7 +1112,7 @@ def preflight(fn_meta, event_file, project_root):
             results.append(("info", "Notes", overrides["notes"]))
 
         _print_preflight(jid, results)
-        passed = not any(s == "fail" for s, _, _ in results)
+        passed = not any(s in ("fail", "alert") for s, _, _ in results)
         _finish(jid, "done", {"checks": results, "passed": passed})
 
     threading.Thread(target=_task, daemon=True).start()
@@ -1028,7 +1121,7 @@ def preflight(fn_meta, event_file, project_root):
 
 def _print_preflight(jid, results):
     """Print pre-flight results with status icons inline in the job log."""
-    icons = {"ok": "✅", "fail": "❌", "warn": "⚠️ ", "info": "ℹ️ "}
+    icons = {"ok": "✅", "fail": "❌", "warn": "⚠️ ", "info": "ℹ️ ", "alert": "🔴"}
     _log(jid, "── Pre-flight checks ─────────────────────")
     for status, label, detail in results:
         icon = icons.get(status, "  ")
