@@ -715,6 +715,57 @@ def _load_overrides(project_root, fn_name):
     return data.get(fn_name, {}) or {}
 
 
+def _classify_invoke(result, overrides):
+    """Classify Lambda invocation outcome into 4 verdicts.
+
+    Returns (verdict, reason, stage_reached) where verdict is one of:
+      - pass               : clean success, status 200, no function_error
+      - pass_with_caveat   : reached external boundary; failure is expected (Floci can't proxy)
+      - fail               : crashed BEFORE expected boundary, or no boundary defined
+      - inconclusive       : timed out without reaching marker; can't tell
+    """
+    log_tail = (result.get("log_tail") or "").lower()
+    output = (result.get("output") or "").lower()
+    fn_err = result.get("function_error")
+    status = result.get("status_code")
+    haystack = log_tail + "\n" + output
+
+    # Expected failure config
+    marker = (overrides.get("expected_failure_marker") or "").lower()
+    stage = overrides.get("expected_failure_stage") or ""
+
+    # Clean PASS
+    if not fn_err and status == 200:
+        return ("pass", "Lambda completed successfully", "handler_complete")
+
+    # Has expected boundary configured
+    if marker:
+        marker_hit = marker in haystack
+        is_timeout = "task timed out" in haystack or "function.timedout" in output
+        if marker_hit:
+            return (
+                "pass_with_caveat",
+                f"Reached expected boundary ({stage} → {overrides.get('expected_failure_marker')}); Floci cannot proxy this call. Internal logic OK.",
+                stage or "external_boundary",
+            )
+        if is_timeout:
+            return (
+                "inconclusive",
+                f"Timed out without reaching expected boundary marker ({overrides.get('expected_failure_marker')}). Logs may be truncated; raise Lambda timeout or check CloudWatch.",
+                "unknown",
+            )
+        # Crashed before marker
+        return (
+            "fail",
+            f"Crashed BEFORE expected boundary ({overrides.get('expected_failure_marker')}). Internal logic broken.",
+            "before_boundary",
+        )
+
+    # No expected_failure config → standard fail
+    why = f"functionError={fn_err}" if fn_err else f"statusCode={status}"
+    return ("fail", why, "handler")
+
+
 def _resolve_fixture(uri, project_root):
     """Resolve a fixture URI to an absolute filesystem path.
 
@@ -1186,7 +1237,14 @@ def invoke(fn_meta, event_file, project_root):
         except OSError:
             result["output"] = ""
 
-        _finish(jid, "done" if not result.get("function_error") else "error", result)
+        overrides = _load_overrides(project_root, fn_meta["name"])
+        verdict, reason, stage = _classify_invoke(result, overrides)
+        result["verdict"] = verdict
+        result["verdict_reason"] = reason
+        result["verdict_stage_reached"] = stage
+
+        finish_status = "done" if verdict in ("pass", "pass_with_caveat") else "error"
+        _finish(jid, finish_status, result)
 
     threading.Thread(target=_task, daemon=True).start()
     return jid

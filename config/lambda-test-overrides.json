@@ -9,6 +9,8 @@
       "skip_seed": "true → skip Seed step entirely (Lambda has no AWS deps).",
       "skip_preflight": "true → skip Pre-flight (Lambda is pure compute, no I/O).",
       "external_apis_required": "[<host>] — third-party hosts the Lambda will call. Pre-flight warns these will fail in Floci. Informational only.",
+      "expected_failure_marker": "<substring> — case-insensitive marker that must appear in log_tail/output to confirm Lambda reached the expected boundary. If hit, verdict = pass_with_caveat (PASS). If crash before marker, verdict = fail. If timeout without marker, verdict = inconclusive.",
+      "expected_failure_stage": "<short-label> — human-readable stage name shown in verdict banner (e.g. 'external_api', 'aws_unsupported', 'compute_complete').",
       "notes": "Free-form text shown in pre-flight output."
     }
   },
@@ -19,7 +21,9 @@
       "949/ac0e92c33e8545699e567ebb553efae2": "fixture://sample-tiny.pdf"
     },
     "extra_buckets": ["beaconstac-pdf-compressor-local"],
-    "notes": "Reads s3://${S3_BUCKET}/${event.key} and writes ${event.key}-old. Ghostscript runs in-container."
+    "expected_failure_marker": "gs:",
+    "expected_failure_stage": "ghostscript_binary_missing",
+    "notes": "Reads s3://${S3_BUCKET}/${event.key} and writes ${event.key}-old. Ghostscript runs in-container — not present in Floci Lambda runtime."
   },
 
   "beaconstac_image_optimizer": {
@@ -53,6 +57,8 @@
       "https://www.googleapis.com (Google Drive API)",
       "AUTH_SERVER_BASE_URL (Django backend OAuth)"
     ],
+    "expected_failure_marker": "googleapis.com",
+    "expected_failure_stage": "external_api",
     "notes": "Real Google sync NOT possible under Floci. Test verifies SQS parse + retry flow. For end-to-end, use staging."
   },
 
@@ -62,6 +68,8 @@
 
   "beaconstac_bulk_qr_generator": {
     "external_apis_required": ["AWS ECS RunTask (NOT in Floci)"],
+    "expected_failure_marker": "ecs",
+    "expected_failure_stage": "aws_unsupported",
     "notes": "Kicks off an ECS task. Floci does not emulate ECS — invoke will fail at ECS RunTask call."
   },
 
@@ -83,6 +91,8 @@
   "beaconstac_analytics_data_stream_to_firehose": {
     "skip_seed": true,
     "external_apis_required": ["AWS Firehose (NOT in Floci)"],
+    "expected_failure_marker": "firehose",
+    "expected_failure_stage": "aws_unsupported",
     "notes": "DDB stream → Firehose. Firehose put_record will fail under Floci."
   },
 
@@ -94,6 +104,8 @@
   "una_ai_chat_data_stream_to_firehose": {
     "skip_seed": true,
     "external_apis_required": ["AWS Firehose (NOT in Floci)"],
+    "expected_failure_marker": "firehose",
+    "expected_failure_stage": "aws_unsupported",
     "notes": "Same as analytics_data_stream_to_firehose but for AI chat."
   },
 
@@ -105,56 +117,78 @@
   "beaconstac_search": {
     "skip_seed": true,
     "external_apis_required": ["Elasticsearch / OpenSearch cluster (NOT in Floci)"],
+    "expected_failure_marker": "elasticsearch",
+    "expected_failure_stage": "external_api",
     "notes": "Kinesis stream → ES. ES write will fail."
   },
 
   "cloudwatch_slack": {
     "external_apis_required": ["https://hooks.slack.com (NOT in Floci)"],
+    "expected_failure_marker": "hooks.slack.com",
+    "expected_failure_stage": "external_api",
     "notes": "SNS-triggered. Will fail at Slack webhook POST."
   },
 
   "beaconstac_intercom_rate_limiter": {
     "external_apis_required": ["https://api.intercom.io (NOT in Floci)"],
+    "expected_failure_marker": "api.intercom.io",
+    "expected_failure_stage": "external_api",
     "notes": "Will fail at Intercom API call."
   },
 
   "beaconstac_intercom_rate_limiter_polo": {
     "external_apis_required": ["https://api.intercom.io (NOT in Floci)"],
+    "expected_failure_marker": "api.intercom.io",
+    "expected_failure_stage": "external_api",
     "notes": "Polo variant."
   },
 
   "beaconstac_publish_user_properties_amplitude": {
     "external_apis_required": ["https://api.amplitude.com (NOT in Floci)"],
+    "expected_failure_marker": "amplitude.com",
+    "expected_failure_stage": "external_api",
     "notes": "Will fail at Amplitude API."
   },
 
   "beaconstac_publish_user_properties_firebase": {
     "external_apis_required": ["Firebase Admin SDK (NOT in Floci)"],
+    "expected_failure_marker": "firebase",
+    "expected_failure_stage": "external_api",
     "notes": "Will fail at Firebase auth."
   },
 
   "beaconstac_zoominfo_enrichment": {
     "external_apis_required": ["https://api.zoominfo.com (NOT in Floci)"],
+    "expected_failure_marker": "zoominfo.com",
+    "expected_failure_stage": "external_api",
     "notes": "Will fail at ZoomInfo API."
   },
 
   "beaconstac_malware_detection": {
     "external_apis_required": ["Google Safe Browsing or similar threat feed"],
+    "expected_failure_marker": "safebrowsing",
+    "expected_failure_stage": "external_api",
     "notes": "Scheduled. Will fail at threat-feed API."
   },
 
   "beaconstac_lead_scoring": {
     "external_apis_required": ["HubSpot/Salesforce API"],
+    "expected_failure_marker": "hubspot",
+    "expected_failure_stage": "external_api",
     "notes": "Handler is currently commented out in serverless.yml."
   },
 
   "beaconstac_azure_integration_tunnel": {
     "external_apis_required": ["Azure AD"],
+    "expected_failure_marker": "microsoftonline",
+    "expected_failure_stage": "external_api",
     "notes": "HTTP-triggered. Real Azure handshake won't work locally."
   },
 
   "beaconstac_cloudfront_invalidator": {
     "external_apis_required": ["AWS CloudFront API (NOT in Floci)"],
+    "expected_failure_marker": "cloudfront",
+    "expected_failure_stage": "aws_unsupported",
     "notes": "Will fail at CloudFront create-invalidation."
   },
 
@@ -165,16 +199,22 @@
 
   "beaconstac_custom_domain_ssl_handler": {
     "external_apis_required": ["AWS ACM (NOT in Floci)", "DNS lookups"],
+    "expected_failure_marker": "acm",
+    "expected_failure_stage": "aws_unsupported",
     "notes": "Will fail at ACM cert request."
   },
 
   "beaconstac_events_sender": {
     "external_apis_required": ["Customer-configured webhook URLs"],
+    "expected_failure_marker": "econnrefused",
+    "expected_failure_stage": "external_api",
     "notes": "Will fail at customer webhook POST. Use webhook.site for staging."
   },
 
   "beaconstac_webhook_service": {
     "external_apis_required": ["Customer webhook URLs"],
+    "expected_failure_marker": "econnrefused",
+    "expected_failure_stage": "external_api",
     "notes": "Same as events_sender — customer URL HTTPS calls."
   },
 
@@ -227,6 +267,8 @@
 
   "third-eye-webhook-consumer": {
     "external_apis_required": ["Third Eye partner webhook"],
+    "expected_failure_marker": "third-eye",
+    "expected_failure_stage": "external_api",
     "notes": "HTTP-triggered. External party calls in."
   },
 
@@ -242,6 +284,8 @@
 
   "webpage-parser-service": {
     "external_apis_required": ["Any HTTPS site (target webpages)"],
+    "expected_failure_marker": "enotfound",
+    "expected_failure_stage": "external_api",
     "notes": "Scrapes HTTP — will fail without real network in Floci."
   },
 
