@@ -99,7 +99,24 @@ pip3 install awscli-local
 - `awscli` — standard AWS CLI
 - `awscli-local` — provides the `awslocal` wrapper that auto-points at `localhost:4566`
 
-### 2. Docker Desktop must be running
+### 2. Install native system libraries (one-time, Mac only)
+
+Several Lambdas use native Node/Python extensions that require system libraries to compile on macOS:
+
+```bash
+brew install pkg-config cairo pango libpng jpeg giflib librsvg vips
+```
+
+| Library | Required by |
+|---------|-------------|
+| `cairo`, `pango`, `libpng`, `jpeg`, `giflib`, `librsvg` | `canvas` (pulled by `chartjs-node-canvas` in `beaconstac_analytics_pdf_generator`) |
+| `vips` | `sharp` in `beaconstac_qr_code_generator` |
+
+Without these, `npm install` will fail with `node-pre-gyp ERR! not ok` during deploy.
+
+> **Python Lambdas** (`weekly_analytics_mailer`, `email_reports`, `beaconstac_analytics_validator`, `beaconstac_lead_scoring`, `beaconstac_image_optimizer`) use `numpy`, `pandas`, `Pillow` — these are packaged inside a matching Linux Docker container by the wizard, so no extra Homebrew deps needed for Python.
+
+### 3. Docker Desktop must be running
 
 The emulator runs in Docker. If Docker isn't running you'll see a "Server unreachable" pill in the status bar.
 
